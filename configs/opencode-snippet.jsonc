@@ -1,0 +1,29 @@
+// Merge this into the `mcp` block of ~/.config/opencode/opencode.jsonc.
+// Replace {{MEMORY_MCP}}, {{GLOBAL_DIR}}, {{GLOBAL_DB}} with the values install.sh prints.
+// Project scope auto-anchors to the project root, so the relative project paths are fine.
+{
+  "mcp": {
+    "memory-global": {
+      "type": "local",
+      "command": ["{{MEMORY_MCP}}", "global"],
+      "environment": {
+        "MCP_MEMORY_BASE_DIR": "{{GLOBAL_DIR}}",
+        "MCP_MEMORY_SQLITE_PATH": "{{GLOBAL_DB}}",
+        "MCP_EXTERNAL_EMBEDDING_URL": "http://localhost:11434/v1/embeddings",
+        "MCP_EXTERNAL_EMBEDDING_MODEL": "qwen3-embedding-4b"
+      },
+      "enabled": true
+    },
+    "memory-project": {
+      "type": "local",
+      "command": ["{{MEMORY_MCP}}", "project"],
+      "environment": {
+        "MCP_MEMORY_BASE_DIR": "./.opencode-memory",
+        "MCP_MEMORY_SQLITE_PATH": "./.opencode-memory/project.db",
+        "MCP_EXTERNAL_EMBEDDING_URL": "http://localhost:11434/v1/embeddings",
+        "MCP_EXTERNAL_EMBEDDING_MODEL": "qwen3-embedding-4b"
+      },
+      "enabled": true
+    }
+  }
+}

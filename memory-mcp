@@ -1,0 +1,173 @@
+#!/usr/bin/env bash
+# memory-mcp — per-session launcher for the opencode-memory MCP server.
+#
+# Every agent CLI (Claude Code / opencode / Codex) execs this with a scope arg
+# (global|project). It:
+#   1. ensures the llama.cpp embedding server is up (lazy-start),
+#   2. anchors project memory to the project ROOT so memory follows the repo,
+#   3. runs weekly backup / SQLite maintenance / association-graph consolidation,
+#   4. execs the Rust MCP server, which speaks MCP over stdio.
+#
+# Pure Rust — no Python. Build the server first: cd rust-memory && cargo build --release.
+set -euo pipefail
+
+scope="${1:-}"
+maintenance_interval="${MCP_MEMORY_MAINTENANCE_INTERVAL:-604800}"
+[[ "$maintenance_interval" =~ ^[0-9]+$ ]] || maintenance_interval=604800
+consolidate_interval="${MCP_MEMORY_CONSOLIDATE_INTERVAL:-604800}"
+[[ "$consolidate_interval" =~ ^[0-9]+$ ]] || consolidate_interval=604800
+
+# Resolve this script's REAL directory (following symlinks) so we can locate the
+# Rust binary and helper scripts even when invoked via a symlink.
+_src="${BASH_SOURCE[0]}"
+while [ -L "$_src" ]; do
+  _dir="$(cd -P "$(dirname "$_src")" && pwd)"
+  _src="$(readlink "$_src")"
+  [[ "$_src" != /* ]] && _src="$_dir/$_src"
+done
+script_dir="$(cd -P "$(dirname "$_src")" && pwd)"
+rust_bin="$script_dir/rust-memory/target/release/opencode-memory"
+
+# Ensure the llama.cpp embedding server is up (lazy-start + wait). The watchdog
+# stops it when no agent CLI is running.
+ensure_embeddings() {
+  if [ -x "$script_dir/llama-embed.sh" ]; then
+    "$script_dir/llama-embed.sh" ensure 2>/dev/null || true
+  fi
+}
+
+backup_db_if_due() {
+  local db_path="$1"
+  [[ -f "$db_path" ]] || return 0
+  command -v sqlite3 >/dev/null 2>&1 || return 0
+
+  local db_dir stamp now last backup_dir label backup_path
+  db_dir="$(cd "$(dirname "$db_path")" && pwd)"
+  stamp="$db_dir/.weekly-backup.stamp"
+  now="$(date +%s)"
+  last=0
+  [[ -f "$stamp" ]] && last="$(cat "$stamp" 2>/dev/null || printf '0')"
+  [[ "$last" =~ ^[0-9]+$ ]] || last=0
+
+  if (( now - last < 604800 )); then
+    return 0
+  fi
+
+  backup_dir="$db_dir/backups"
+  mkdir -p "$backup_dir"
+  label="$(basename "$db_path" .db)"
+  backup_path="$backup_dir/${label}-$(date +%Y%m%d-%H%M%S).db"
+  sqlite3 "$db_path" ".backup '$backup_path'" >/dev/null
+  printf '%s\n' "$now" > "$stamp"
+  find "$backup_dir" -name "${label}-*.db" -type f -mtime +90 -delete 2>/dev/null || true
+}
+
+maintain_db_if_due() {
+  local db_path="$1"
+  [[ -f "$db_path" ]] || return 0
+  command -v sqlite3 >/dev/null 2>&1 || return 0
+
+  local db_dir stamp lock_dir now last qc
+  db_dir="$(cd "$(dirname "$db_path")" && pwd)"
+  stamp="$db_dir/.weekly-maintenance.stamp"
+  lock_dir="$db_dir/.maintenance.lock"
+  now="$(date +%s)"
+  last=0
+  [[ -f "$stamp" ]] && last="$(cat "$stamp" 2>/dev/null || printf '0')"
+  [[ "$last" =~ ^[0-9]+$ ]] || last=0
+
+  if (( now - last < maintenance_interval )); then
+    return 0
+  fi
+
+  mkdir "$lock_dir" 2>/dev/null || return 0
+
+  qc="$(sqlite3 "$db_path" 'PRAGMA quick_check;' 2>/dev/null || true)"
+  if [[ "$qc" != "ok" ]]; then
+    echo "warning: memory DB quick_check failed for $db_path: ${qc:-no output}" >&2
+    rmdir "$lock_dir" 2>/dev/null || true
+    return 0
+  fi
+
+  sqlite3 "$db_path" 'PRAGMA optimize;' >/dev/null 2>&1 || true
+  printf '%s\n' "$now" > "$stamp"
+  rmdir "$lock_dir" 2>/dev/null || true
+}
+
+consolidate_db_if_due() {
+  # Build the association graph (memory_graph edges) weekly so the graph
+  # `connected`/`subgraph`/`path` actions work. Detached (never blocks startup),
+  # lock-guarded, idempotent. Uses the Rust consolidator — reads stored
+  # embeddings directly from the DB, no embedding-server call.
+  local db_path="$1"
+  [[ -f "$db_path" && -x "$rust_bin" ]] || return 0
+
+  local db_dir stamp lock_dir now last
+  db_dir="$(cd "$(dirname "$db_path")" && pwd)"
+  stamp="$db_dir/.weekly-consolidate.stamp"
+  lock_dir="$db_dir/.consolidate.lock"
+  now="$(date +%s)"
+  last=0
+  [[ -f "$stamp" ]] && last="$(cat "$stamp" 2>/dev/null || printf '0')"
+  [[ "$last" =~ ^[0-9]+$ ]] || last=0
+
+  if (( now - last < consolidate_interval )); then
+    return 0
+  fi
+
+  mkdir "$lock_dir" 2>/dev/null || return 0
+  printf '%s\n' "$now" > "$stamp"
+  ( nohup "$rust_bin" consolidate "$db_path" >>"$db_dir/.consolidate.log" 2>&1
+    rmdir "$lock_dir" 2>/dev/null || true ) &
+}
+
+case "$scope" in
+  global)
+    export MCP_MEMORY_BASE_DIR="${MCP_MEMORY_BASE_DIR:-$HOME/.config/opencode/memory}"
+    export MCP_MEMORY_SQLITE_PATH="${MCP_MEMORY_SQLITE_PATH:-$HOME/.config/opencode/memory/global.db}"
+    ;;
+  project)
+    # Anchor project memory to the PROJECT ROOT so memory follows the project,
+    # not the launch directory. Detection order:
+    #   1. VCS toplevel (git, then hg/svn markers)
+    #   2. nearest ancestor (up to $HOME) holding a project marker
+    #   3. CWD as last resort
+    # Works for non-VCS projects via the marker walk. An explicit ABSOLUTE
+    # MCP_MEMORY_SQLITE_PATH always wins (no anchoring).
+    if [[ "${MCP_MEMORY_SQLITE_PATH:-}" != /* ]]; then
+      proj_root="$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null || true)"
+      if [[ -z "$proj_root" ]]; then
+        d="$PWD"
+        while [[ "$d" != "/" && "$d" != "$HOME" ]]; do
+          if [[ -d "$d/.opencode-memory" || -d "$d/.git" || -d "$d/.hg" || -d "$d/.svn" \
+                || -f "$d/pyproject.toml" || -f "$d/setup.py" || -f "$d/package.json" \
+                || -f "$d/Cargo.toml" || -f "$d/go.mod" || -f "$d/pom.xml" \
+                || -f "$d/CMakeLists.txt" || -f "$d/CLAUDE.md" || -f "$d/AGENTS.md" ]]; then
+            proj_root="$d"; break
+          fi
+          d="$(dirname "$d")"
+        done
+        [[ -n "$proj_root" ]] || proj_root="$PWD"
+      fi
+      export MCP_MEMORY_BASE_DIR="$proj_root/.opencode-memory"
+      export MCP_MEMORY_SQLITE_PATH="$proj_root/.opencode-memory/project.db"
+    fi
+    ;;
+  *)
+    echo "usage: $0 global|project" >&2
+    exit 64
+    ;;
+esac
+
+if [[ ! -x "$rust_bin" ]]; then
+  echo "opencode-memory server not built: $rust_bin" >&2
+  echo "build it:  ( cd \"$script_dir/rust-memory\" && cargo build --release )" >&2
+  exit 127
+fi
+
+ensure_embeddings
+backup_db_if_due "$MCP_MEMORY_SQLITE_PATH"
+maintain_db_if_due "$MCP_MEMORY_SQLITE_PATH"
+consolidate_db_if_due "$MCP_MEMORY_SQLITE_PATH"
+
+exec "$rust_bin" "$scope"

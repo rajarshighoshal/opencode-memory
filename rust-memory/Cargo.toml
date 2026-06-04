@@ -1,0 +1,55 @@
+[package]
+name = "opencode-memory"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.96"
+description = "Persistent semantic memory for AI agents — a single stdio MCP server over SQLite + sqlite-vec with local llama.cpp embeddings."
+license = "MIT"
+
+# Produced binary is invoked as `opencode-memory <global|project>` from the
+# memory-mcp wrapper, mirroring the Python `memory server` stdio entrypoint.
+[[bin]]
+name = "opencode-memory"
+path = "src/main.rs"
+
+[dependencies]
+# --- MCP server SDK (official Rust SDK). Pin 1.7.x; macros + stdio transport.
+#     transport-io gates rmcp::transport::stdio(); schemars derives tool input
+#     JSON-Schema. server+macros are default but listed for clarity.
+rmcp = { version = "1.7", features = ["server", "macros", "transport-io", "schemars"] }
+
+# --- async runtime + process spawning (llama-embed.sh ensure) + stdio
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "process", "sync", "time"] }
+
+# --- SQLite + sqlite-vec (vec0). bundled = SQLite 3.51.x compiled in;
+#     sqlite-vec statically links sqlite-vec.c and exports sqlite3_vec_init.
+#     Pin sqlite-vec EXACTLY to 0.1.9 to match the on-disk vec0 format the
+#     existing DBs were written with (0.1.10 is alpha only).
+rusqlite = { version = "0.40", features = ["bundled"] }
+sqlite-vec = "=0.1.9"
+
+# --- embedding HTTP client. rustls-tls avoids OpenSSL on macOS (endpoint is
+#     plain-HTTP localhost, but a TLS backend is still linked).
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "rustls-native-certs", "http2"] }
+
+# --- serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "1"
+
+# --- content_hash = sha256(content.strip().lower()) ; lowercase hex
+sha2 = "0.10"
+hex = "0.4"
+
+# --- f32 vector <-> raw little-endian byte blob (10240 B for dim 2560)
+bytemuck = "1"
+
+# --- errors + logging (logs MUST go to stderr; stdout is the JSON-RPC channel)
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# --- timestamps: created_at (epoch f64) + created_at_iso
+#     (Python datetime.utcfromtimestamp(ts).isoformat()+"Z", microsecond prec)
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

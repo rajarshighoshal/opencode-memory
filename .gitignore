@@ -1,0 +1,16 @@
+# Rust build artifacts
+/rust-memory/target
+
+# macOS
+.DS_Store
+
+# logs
+*.log
+
+# local memory data — NEVER commit memories or backups
+/.opencode-memory/
+**/.opencode-memory/
+**/backups/
+*.db
+*.db-wal
+*.db-shm

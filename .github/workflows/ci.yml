@@ -1,0 +1,46 @@
+name: ci
+
+# Cross-machine backstop for the Rust memory server: build + test + clippy on
+# every push/PR that touches rust-memory/. Complements the local .githooks/pre-push
+# gate (which covers the dev machine) by also catching pushes made from anywhere
+# else. reqwest uses rustls (no OpenSSL needed); the only network test (e2e_copy)
+# skips when MCP_MEMORY_SQLITE_PATH is unset, so the suite is green without llama.cpp.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'rust-memory/**'
+      - '.github/workflows/ci.yml'
+  pull_request:
+    paths:
+      - 'rust-memory/**'
+      - '.github/workflows/ci.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust-memory
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust-memory
+      - name: build
+        run: cargo build --release
+      - name: clippy (warnings = errors)
+        run: cargo clippy --release -- -D warnings
+      - name: test
+        run: cargo test --release
