@@ -54,7 +54,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     // CLI subcommand: `opencode-memory consolidate <db-path>` — one-shot
-    // association-graph build (the Rust replacement for consolidate.py), invoked
+    // association-graph build, invoked
     // weekly by the wrapper. No MCP server, no embedding calls (reads stored
     // embeddings). stdout is a human/cron log here, not the JSON-RPC transport.
     let argv: Vec<String> = std::env::args().collect();

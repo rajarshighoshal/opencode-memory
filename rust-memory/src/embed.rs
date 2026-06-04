@@ -1,19 +1,17 @@
 //! Embedding client for the llama.cpp OpenAI-compatible server.
 //!
-//! Replaces Python `embeddings/external_api.py::ExternalEmbeddingModel`.
-//!
-//! Endpoint (live, verified): `POST http://127.0.0.1:11434/v1/embeddings`
+//! Endpoint: `POST http://127.0.0.1:11434/v1/embeddings`
 //!   request : `{"input": <string|[string]>, "model": "qwen3-embedding-4b"}`
 //!   response: `{"model","object","usage":{...},"data":[{"embedding":[..2560 f32..],"index":0,"object":"embedding"}]}`
 //!
 //! Key behaviors to preserve:
 //!   * Vectors come back ALREADY L2-normalized (‖v‖≈1.0). Do NOT normalize.
 //!   * Batch responses may arrive out of order — reorder by `data[i].index`.
-//!   * dim is fixed at 2560; assert on first response.
-//!   * Lazy-ensure self-heal: on connection-refused, run `llama-embed.sh ensure`
-//!     once (guarded so concurrent calls don't fan out N starts), then retry
-//!     with capped exponential backoff. The watchdog can stop the server
-//!     mid-session, so relying on launch-time ensure alone is insufficient.
+//!   * dim is fixed at 2560; validated on every response.
+//!   * Lazy ensure: on connection-refused, run `llama-embed.sh ensure` once
+//!     (guarded so concurrent calls don't fan out N starts), then retry with
+//!     capped exponential backoff. A watchdog can stop the server mid-session,
+//!     so ensuring it once at launch is not enough.
 
 use crate::config::{EmbedConfig, EMBEDDING_DIM};
 use crate::error::EmbedError;
@@ -76,9 +74,9 @@ impl EmbedClient {
 
     /// Embed a batch of strings, preserving input order.
     ///
-    /// Chunks into `cfg.batch_size` (32, matching Python), POSTs each chunk,
-    /// reorders each chunk's results by `index`, validates `len == 2560` and
-    /// all-finite, concatenates in order. Does NOT normalize.
+    /// Chunks into `cfg.batch_size` (default 32), POSTs each chunk, reorders each
+    /// chunk's results by `index`, validates `len == 2560` and all-finite, then
+    /// concatenates in order. Does NOT normalize (vectors arrive L2-normalized).
     pub async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {
         if texts.is_empty() {
             return Ok(Vec::new());
@@ -218,7 +216,7 @@ impl EmbedClient {
 
 /// Reorder a chunk's items by their `index` field into a dense `Vec`, validating
 /// no duplicate/missing/out-of-bounds indices and that every vector is exactly
-/// [`EMBEDDING_DIM`] wide and finite. Mirrors the Python defensive reorder.
+/// [`EMBEDDING_DIM`] wide and finite.
 fn reorder_and_validate(items: Vec<EmbedItem>, expected_len: usize) -> Result<Vec<Vec<f32>>, EmbedError> {
     if items.len() != expected_len {
         return Err(EmbedError::BadResponse(format!(

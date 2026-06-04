@@ -1,19 +1,18 @@
-//! Association-graph builder — the Rust replacement for `consolidate.py`.
+//! Association-graph builder.
 //!
 //! Runs as a one-shot CLI step (`opencode-memory consolidate <db-path>`), invoked
-//! weekly by the `memory-mcp` wrapper. Needs NO Python and NO embedding server:
-//! it reads the embeddings already stored in the DB, computes pairwise cosine
-//! similarity, and writes `memory_graph` edges for pairs inside a per-DB window.
+//! weekly by the `memory-mcp` wrapper. Requires no embedding server: it reads the
+//! embeddings already stored in the DB, computes pairwise cosine similarity, and
+//! writes `memory_graph` edges for pairs inside a per-DB similarity window.
 //!
-//! ## Model (deliberately simpler than the Python DreamInspiredConsolidator)
-//! The Python original blends several heuristics (temporal_proximity,
-//! shared_concepts, similar_structure, complementary_content, ...). We use the
-//! dominant, well-defined signal — semantic cosine of the stored embeddings —
-//! mapped to `(cos + 1) / 2` (the SAME scale as the existing edges), plus a cheap
-//! `shared_tags` flag. `connection_types` reflects exactly what we computed.
-//! The `memory_graph connected` reader only walks edges, so this is fully
-//! compatible; edges are additive (`INSERT OR REPLACE`), `relationship_type`
-//! stays `related` (no auto-supersede). Dangling edges are pruned each run.
+//! ## Model
+//! Edges are scored on a single, well-defined signal — semantic cosine of the
+//! stored embeddings — mapped to `(cos + 1) / 2` so scores land on the same [0, 1]
+//! scale the rest of the graph uses, plus a cheap `shared_tags` flag.
+//! `connection_types` reflects exactly what we computed. The graph reader only
+//! walks edges, so writing only `related` edges is safe; edges are additive
+//! (`INSERT OR REPLACE`) and never auto-supersede a memory. Dangling edges (whose
+//! endpoints no longer exist) are pruned each run.
 
 use crate::error::Result;
 use crate::models::tags_from_csv;
@@ -47,9 +46,9 @@ fn quantile_sorted(sorted: &[f64], q: f64) -> f64 {
     sorted[lo] + frac * (sorted[hi] - sorted[lo])
 }
 
-/// Pick the similarity window [lo, hi] from the data, mirroring `consolidate.py`
-/// `pick_window`: keep the graph sparse by using the 0.88 quantile of pairwise
-/// mapped similarities as the lower bound (clamped to [0.50, 0.90]); hi = 0.98.
+/// Pick the similarity window [lo, hi] from the data: keep the graph sparse by
+/// using the 0.88 quantile of pairwise mapped similarities as the lower bound
+/// (clamped to [0.50, 0.90]); hi = 0.98.
 fn pick_window(normalized: &[Vec<f32>]) -> (f64, f64) {
     let n = normalized.len();
     if n < 2 {
@@ -106,7 +105,7 @@ pub fn run(db_path: &str) -> Result<Report> {
     let _ = conn.pragma_update(None, "journal_mode", "WAL");
     let _ = conn.pragma_update(None, "synchronous", "NORMAL");
 
-    // Load live memories (id -> hash/tags) and their stored embeddings (rowid == id).
+    // Load non-deleted memories (id -> hash/tags) and their stored embeddings (rowid == id).
     let mut hashes: Vec<String> = Vec::new();
     let mut tag_lists: Vec<Vec<String>> = Vec::new();
     let mut norms: Vec<Vec<f32>> = Vec::new();
@@ -176,7 +175,7 @@ pub fn run(db_path: &str) -> Result<Report> {
                         "{{\"discovery_method\": \"semantic_cosine\", \"confidence\": {:.6}}}",
                         sim
                     );
-                    // Symmetric edge (both directions), matching the existing graph.
+                    // Write both directions: the graph stores symmetric edges.
                     ins.execute(params![hashes[i], hashes[j], sim, ct, metadata, now])?;
                     ins.execute(params![hashes[j], hashes[i], sim, ct, metadata, now])?;
                 }

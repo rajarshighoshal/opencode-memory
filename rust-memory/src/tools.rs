@@ -2,15 +2,15 @@
 //! `memory_store, memory_search, memory_list, memory_delete, memory_update,
 //!  memory_health, memory_stats, memory_graph`.
 //!
-//! The Python server registers ~20 tools but the opencode.jsonc permission
-//! allow-list permits only these 8, so implementing them is sufficient for a
-//! drop-in. The other 12 (memory_observe, memory_consolidate, mistake_note_*, …)
-//! are unreachable by these CLIs and are out of scope for v1.
+//! The opencode.jsonc permission allow-list permits only these 8, so they are
+//! the complete reachable surface. Other tools (memory_observe,
+//! memory_consolidate, mistake_note_*, …) are not exposed to these CLIs and are
+//! out of scope for v1.
 //!
-//! ## Output-format fidelity (highest-risk drop-in detail)
+//! ## Output-format fidelity (highest-risk detail)
 //! Each tool returns `content: [{type:"text", text:<string>}]` but the *string*
-//! shape differs per tool — some prose, some JSON-stringified. A caller that
-//! greps the text will break if we don't match:
+//! shape differs per tool — some prose, some JSON-stringified. Callers that grep
+//! the text depend on these exact shapes:
 //!   * store/search/delete/update -> PLAIN TEXT templates.
 //!   * list/stats/graph           -> JSON-stringified.
 //!   * health                     -> `"Database Health Check Results:\n"` + JSON.
@@ -82,7 +82,7 @@ impl Drop for QueryTimer {
 /// Metadata sub-object accepted by `memory_store` (this is where tags + type live).
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct StoreMetadata {
-    /// Tags. Accepts an array of strings OR a comma-separated string (Python parity).
+    /// Tags. Accepts an array of strings OR a comma-separated string.
     #[serde(default)]
     pub tags: Tags,
     /// Memory type (observation, insight, decision, ...).
@@ -246,7 +246,7 @@ impl MemoryServer {
 
     /// Embedding provenance stamped into each stored memory's metadata so a future
     /// model upgrade is detectable + re-embeddable. No schema change — metadata is
-    /// a JSON blob shared with the legacy Python rows, which simply lack the keys.
+    /// a free-form JSON blob, and older rows simply lack these keys.
     fn provenance_metadata(&self) -> serde_json::Value {
         serde_json::json!({
             "embedding_model": self.config.embed.model,
@@ -267,11 +267,10 @@ impl MemoryServer {
             return Ok(text_result("Error: Content is required".to_string()));
         }
 
-        // tags + type live UNDER metadata in memory_store. Default type = "note"
-        // (the HTTP/MCP store handler default). Empty tags -> ["untagged"] per
-        // Memory.__post_init__. Tags are normalize_tags()'d (lowercase + trim +
-        // comma->hyphen + dedup) so the persisted CSV is byte-compatible with the
-        // live Python DB.
+        // tags + type live UNDER metadata in memory_store. Default type = "note".
+        // Empty tags collapse to ["untagged"]. Tags are normalize_tags()'d
+        // (lowercase + trim + comma->hyphen + dedup) before they are joined into
+        // the comma-separated string persisted in the DB.
         let (raw_tags, mem_type) = match &args.metadata {
             Some(md) => (
                 md.tags.clone().into_vec(),
@@ -298,8 +297,8 @@ impl MemoryServer {
             content: args.content.clone(),
             tags,
             memory_type: mem_type,
-            // metadata: strip the tags/type keys (they have dedicated fields),
-            // matching the service which pops them before persisting.
+            // metadata: tags/type are not duplicated here — they have dedicated
+            // columns and are stripped before this blob is persisted.
             metadata: self.provenance_metadata(),
             conversation_id: args.conversation_id.clone(),
         };
@@ -332,8 +331,8 @@ impl MemoryServer {
         let query = args.query.clone().unwrap_or_default();
         let limit = args.limit.unwrap_or(10).clamp(1, 100);
 
-        // Normalize filter tags (lowercase + trim + dedup) to match Python's
-        // normalize_tags on every search filter.
+        // Normalize filter tags (lowercase + trim + dedup) so they compare
+        // consistently against the normalized tags stored in the DB.
         let norm_tags = normalize_tags(&args.tags.clone().into_vec());
         let sq = SearchQuery {
             query: args.query.clone(),
@@ -350,8 +349,8 @@ impl MemoryServer {
         let embedding = if matches!(mode, SearchMode::Exact) {
             None
         } else if query.is_empty() {
-            // No query for a semantic-family search: nothing to embed; the search
-            // returns empty (matches the service guard for query-less semantic).
+            // No query for a semantic-family search: nothing to embed, so the
+            // search returns empty.
             None
         } else {
             match self.embed.embed_one(&query).await {
@@ -367,11 +366,10 @@ impl MemoryServer {
             Err(e) => return Ok(text_result(format!("Error searching memories: {e}"))),
         };
 
-        // For ALL tag_match, apply the post-filter the service does (SQL tag
-        // filter is ANY-match only). Compare case-insensitively: Python compares
-        // already-lowercased query tags against lowercased stored tags, so we
-        // lowercase both sides here (sq.tags is normalized to lowercase, but
-        // stored tags could be legacy mixed-case).
+        // For ALL tag_match, post-filter in Rust because the SQL tag filter is
+        // ANY-match only. Compare case-insensitively: sq.tags is already
+        // lowercased by normalize_tags, but older stored tags could be
+        // mixed-case, so lowercase both sides here.
         let hits = if sq.tag_match == TagMatch::All && !sq.tags.is_empty() {
             hits.into_iter()
                 .filter(|h| {
@@ -405,8 +403,8 @@ impl MemoryServer {
 
         match self.storage.list(&lq) {
             Ok(page) => {
-                // Per-memory shape mirrors _format_memory_response (key order matters
-                // for a byte-identical drop-in, so build maps explicitly).
+                // Build each memory's JSON map explicitly: key order is part of
+                // the output contract callers depend on.
                 let mems: Vec<serde_json::Value> = page
                     .memories
                     .iter()
@@ -432,7 +430,7 @@ impl MemoryServer {
                     "total_pages": page.total_pages,
                     "has_more": page.has_more,
                 });
-                // Python uses json.dumps(result, indent=2, default=str).
+                // Serialize pretty-printed (2-space indent) JSON.
                 Ok(text_result(
                     serde_json::to_string_pretty(&out).unwrap_or_else(|_| "{}".to_string()),
                 ))
@@ -467,7 +465,7 @@ impl MemoryServer {
                 dry_run,
                 &outcome.message,
             ))),
-            // Errors surface as `Error: <msg>` (the unified handler's failure branch).
+            // Invalid-arg / not-found surface as plain `Error: <msg>`.
             Err(MemoryError::InvalidArg(m)) | Err(MemoryError::NotFound(m)) => {
                 Ok(text_result(format!("Error: {m}")))
             }
@@ -508,7 +506,7 @@ impl MemoryServer {
             }
 
             // Resolve carry-over tags/type from the existing row unless overridden.
-            // Accept array OR CSV-string form, then normalize_tags (Python parity).
+            // Accept array OR CSV-string form, then normalize_tags.
             let new_tags = updates_obj.get("tags").map(|v| {
                 let raw: Vec<String> = match v {
                     serde_json::Value::Array(a) => a
@@ -546,9 +544,9 @@ impl MemoryServer {
     }
 
     /// Versioned supersede: embed + store the new content (dedup-skipped), then
-    /// stamp the old row's `metadata.superseded_by = <new_hash>` (matching the
-    /// Python `update_memory_versioned`, which sets metadata — NOT the column —
-    /// so superseded rows still surface in search unless explicitly filtered).
+    /// stamp the old row's `metadata.superseded_by = <new_hash>`. The supersede
+    /// marker lives in metadata, NOT in a dedicated column, so superseded rows
+    /// still surface in search unless explicitly filtered out.
     async fn versioned_update(
         &self,
         content_hash: &str,
@@ -613,9 +611,8 @@ impl MemoryServer {
         };
         let size_mb = (stats.database_size_bytes as f64 / (1024.0 * 1024.0) * 100.0).round() / 100.0;
 
-        // Mirror the SqliteHealthChecker stats dict exactly. (DESIGN.md mentions
-        // embedding_dimension; the live Python health stats does NOT include it,
-        // so we omit it to stay byte-faithful — see deviations note.)
+        // Health statistics block. embedding_dimension is intentionally omitted
+        // here to keep this dict in sync with the documented health-stats shape.
         let statistics = serde_json::json!({
             "status": "healthy",
             "backend": "sqlite-vec",
@@ -649,15 +646,15 @@ impl MemoryServer {
     }
 
     /// Process-local cache telemetry (NOT memory counts). Returns a minimal
-    /// JSON STRING compatible with the Python shape so the allow-listed call
-    /// doesn't error.
+    /// JSON STRING in the shape callers expect so the allow-listed call doesn't
+    /// error.
     #[tool(description = "Report process-local cache and performance telemetry")]
     pub async fn memory_stats(&self) -> Result<CallToolResult, McpError> {
         let _t = self.timer();
-        // Process-local cache telemetry. This Rust binary has no global init-cache
-        // (one process per scope), so the counters are zeroed — but the SHAPE
-        // matches calculate_cache_stats_dict + the backend_info block that
-        // handle_get_cache_stats appends, so any parser sees the expected keys.
+        // Process-local cache telemetry. This binary has no global init-cache
+        // (one process per scope), so the counters are zeroed — but the key SHAPE
+        // (cache stats + a backend_info block) is preserved so any parser sees
+        // the expected keys.
         let result = serde_json::json!({
             "total_calls": 0,
             "hit_rate": 0.0,
@@ -824,8 +821,8 @@ impl MemoryServer {
 
 #[tool_handler]
 impl ServerHandler for MemoryServer {
-    /// Advertise the SAME server name (`"memory"`) the Python low-level server
-    /// uses, so the opencode client negotiates identically (drop-in).
+    /// Advertise the server name (`"memory"`) the opencode client expects, so
+    /// capability negotiation succeeds.
     fn get_info(&self) -> ServerInfo {
         // ServerInfo (= InitializeResult) and Implementation are #[non_exhaustive],
         // so we cannot use struct-literal syntax from outside the crate. Build via

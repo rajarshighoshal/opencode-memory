@@ -1,13 +1,13 @@
 //! Crate-wide error types.
 //!
 //! Two layers:
-//!   * [`EmbedError`] — failures of the llama.cpp embedding client. Mirrors the
-//!     Python `ExternalEmbeddingModel` failure modes so the retry/lazy-ensure
-//!     logic can branch on connect-refused vs bad-response vs dim-mismatch.
+//!   * [`EmbedError`] — failures of the llama.cpp embedding client. Variants are
+//!     split by failure mode (connect-refused vs bad-response vs dim-mismatch) so
+//!     the retry/lazy-ensure logic can branch on them.
 //!   * [`MemoryError`] — top-level error for storage + tool handlers. Tool
 //!     handlers convert this into a human-readable `Error: ...` text payload
-//!     (the Python server returns prose, not a JSON-RPC error, for most tool
-//!     failures), so `MemoryError` is mostly for the storage/main plumbing.
+//!     rather than a JSON-RPC error for most tool failures, so `MemoryError` is
+//!     mostly for the storage/main plumbing.
 
 use thiserror::Error;
 
@@ -32,7 +32,7 @@ pub enum EmbedError {
     #[error("embedding dim mismatch: expected {expected}, got {got}")]
     DimMismatch { expected: usize, got: usize },
 
-    /// Embedding contained NaN/Inf (Python validates all-finite before storing).
+    /// Embedding contained NaN/Inf; vectors must be all-finite before storing.
     #[error("embedding contained non-finite value")]
     NonFinite,
 }

@@ -1,8 +1,9 @@
-//! sqlite-vec storage layer — the heart of the drop-in.
+//! sqlite-vec storage layer.
 //!
-//! Reuses the EXISTING DBs with NO migration. The on-disk vec0 format
+//! Opens existing DBs in place with no migration. The on-disk vec0 format
 //! (`FLOAT[2560] distance_metric=cosine`, raw LE-f32 blobs) and the SHA-256
-//! content_hash are byte-identical to what the Python impl writes.
+//! content_hash are part of the stable on-disk contract — anything reading or
+//! writing these DBs must agree on them exactly.
 //!
 //! ## Extension loading (static link, preferred)
 //! `sqlite-vec` 0.1.9 statically compiles `sqlite-vec.c` and exports
@@ -17,7 +18,7 @@
 //! ```
 //! No dylib and no `enable_load_extension` needed — the extension is compiled in.
 //!
-//! ## PRAGMAs (match the running Python server / cron so WAL stays compatible)
+//! ## PRAGMAs (kept consistent across all processes so WAL stays compatible)
 //! `journal_mode=WAL`, `busy_timeout=5000`, `synchronous=NORMAL`.
 //!
 //! ## Schema (already present; we only ever touch `memories`, `memory_embeddings`,
@@ -43,8 +44,8 @@ type GraphNode = (String, usize);
 /// `(source_hash, target_hash, similarity)` — an edge in a subgraph result.
 type GraphEdge = (String, String, f64);
 
-/// Escape LIKE metacharacters for use with `ESCAPE '\'`. Mirrors Python `_escape_like`:
-/// backslash first, then `%` and `_`.
+/// Escape LIKE metacharacters for use with `ESCAPE '\'`. Order matters:
+/// backslash first (so the escapes we add aren't re-escaped), then `%` and `_`.
 fn escape_like(value: &str) -> String {
     value
         .replace('\\', "\\\\")
@@ -52,7 +53,7 @@ fn escape_like(value: &str) -> String {
         .replace('_', "\\_")
 }
 
-/// Wall-clock epoch seconds (matches Python `time.time()`).
+/// Wall-clock epoch seconds, used for `created_at`/`updated_at`/`deleted_at`.
 fn now_epoch() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -89,8 +90,8 @@ fn apply_recency(hits: &mut [SearchHit], halflife_days: f64) {
     });
 }
 
-/// Parse a `YYYY-MM-DD` (or full ISO) date bound to epoch seconds, treating naive
-/// datetimes as UTC — exactly as the Python service does for `after`/`before`.
+/// Parse a `YYYY-MM-DD` (or full ISO) date bound to epoch seconds for the
+/// `after`/`before` filters, treating naive datetimes as UTC.
 fn parse_iso_date_to_epoch(s: &str) -> Option<f64> {
     use chrono::{NaiveDate, NaiveDateTime, TimeZone, Utc};
     // Try full datetime first, then date-only at midnight UTC.
@@ -133,15 +134,15 @@ pub fn register_vec_extension() -> Result<()> {
 /// handles one request at a time anyway, so contention is negligible.
 pub struct Storage {
     conn: Mutex<Connection>,
-    /// Semantic-dedup config, read from env at open time, mirroring the Python
-    /// `SqliteVecMemoryStorage.__init__` (`MCP_SEMANTIC_DEDUP_ENABLED` default
-    /// true, `MCP_SEMANTIC_DEDUP_THRESHOLD` 0.85, `MCP_SEMANTIC_DEDUP_TIME_WINDOW_HOURS` 24).
+    /// Semantic-dedup config, read from env at open time
+    /// (`MCP_SEMANTIC_DEDUP_ENABLED` default true, `MCP_SEMANTIC_DEDUP_THRESHOLD`
+    /// 0.85, `MCP_SEMANTIC_DEDUP_TIME_WINDOW_HOURS` 24).
     semantic_dedup_enabled: bool,
     semantic_dedup_threshold: f64,
     semantic_dedup_time_window_hours: f64,
 }
 
-/// Semantic-dedup settings resolved from the environment (Python parity).
+/// Semantic-dedup settings resolved from the environment.
 struct SemanticDedupConfig {
     enabled: bool,
     threshold: f64,
@@ -183,7 +184,7 @@ pub struct StoreArgs {
 
 /// Outcome of a store. `Duplicate` carries the existing hash (exact-hash hit);
 /// `SemanticDuplicate` carries the hash of the near-duplicate that blocked the
-/// store (semantic-dedup hit, default-enabled like the Python server).
+/// store (semantic-dedup hit, enabled by default).
 #[derive(Debug)]
 pub enum StoreOutcome {
     Stored { content_hash: String },
@@ -253,7 +254,7 @@ pub struct DeleteOutcome {
 pub struct DbStats {
     pub total_memories: usize,
     // Computed for completeness but intentionally NOT surfaced in the
-    // byte-parity health output (the Python stats omit them too).
+    // health output.
     #[allow(dead_code)]
     pub unique_tags: usize,
     #[allow(dead_code)]
@@ -264,12 +265,11 @@ pub struct DbStats {
     pub embedding_dimension: usize,
 }
 
-/// Create the canonical schema if absent so a BRAND-NEW DB works without the
-/// retired Python service. Idempotent — every statement is `IF NOT EXISTS`, so
-/// it is a no-op on existing (Python-created) DBs and never alters them. The
-/// vec0 extension must already be registered (main does it before open). Schema
-/// is byte-identical to the Python `_initialize_schema` (dim 2560, FTS5 trigram
-/// external-content mirror + sync triggers, association-graph table).
+/// Create the canonical schema if absent so a brand-new DB is usable. Idempotent
+/// — every statement is `IF NOT EXISTS`, so it is a no-op on existing DBs and
+/// never alters them. The vec0 extension must already be registered (main does it
+/// before open). Schema is dim 2560 with an FTS5 trigram external-content mirror
+/// plus sync triggers and the association-graph table.
 fn ensure_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS metadata (
@@ -339,20 +339,20 @@ impl Storage {
     /// (proves the extension is registered). Assumes [`register_vec_extension`]
     /// already ran.
     pub fn open(cfg: &Config) -> Result<Self> {
-        // Ensure the parent directory exists (mirrors Python os.makedirs).
+        // Ensure the parent directory exists before opening.
         if let Some(parent) = cfg.db_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
         let conn = Connection::open(&cfg.db_path)?;
-        // PRAGMAs to stay WAL-compatible with the running Python server / cron.
+        // PRAGMAs kept consistent across processes so WAL stays compatible.
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "busy_timeout", 5000)?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         // Verify the vec0 extension is live (proves register_vec_extension ran).
         let _v: String = conn.query_row("SELECT vec_version()", [], |r| r.get(0))?;
         // Bootstrap the schema for a brand-new DB (no-op on existing DBs). Without
-        // this, a fresh project the retired Python service never created would have
-        // no `memories` table and every store would fail ("no such table: memories").
+        // this, a freshly created DB would have no `memories` table and every store
+        // would fail ("no such table: memories").
         ensure_schema(&conn)?;
         let dedup = SemanticDedupConfig::from_env();
         Ok(Self {
@@ -369,7 +369,7 @@ impl Storage {
         Ok(conn.query_row("SELECT vec_version()", [], |r| r.get(0))?)
     }
 
-    /// Store a memory atomically (the Python 5-step sequence):
+    /// Store a memory atomically, in five steps:
     ///   1. exact-hash dedup: SELECT WHERE content_hash=? AND deleted_at IS NULL -> skip if present.
     ///   2. tombstone purge: DELETE FROM memories WHERE content_hash=? AND deleted_at IS NOT NULL
     ///      (also delete the orphaned memory_embeddings row for that old id).
@@ -381,8 +381,8 @@ impl Storage {
         let hash = content_hash(&args.content);
         let mut conn = self.conn.lock().unwrap();
 
-        // Step 1: exact-hash dedup (live rows only). Python returns
-        // "Duplicate content detected (exact match)" and stores nothing.
+        // Step 1: exact-hash dedup (live rows only) -> store nothing if a live row
+        // with this hash already exists.
         let existing: Option<String> = conn
             .query_row(
                 "SELECT content_hash FROM memories WHERE content_hash = ?1 AND deleted_at IS NULL",
@@ -394,12 +394,12 @@ impl Storage {
             return Ok(StoreOutcome::Duplicate { content_hash: h });
         }
 
-        // Semantic dedup (default-enabled, mirroring sqlite_vec.py:1392). Skipped
-        // when the caller signals an incremental save (conversation_id set) or for
-        // session memories (memory_type == "session"). Exact-hash dedup above is
-        // always enforced. When the incoming embedding is >= threshold cosine-similar
-        // to a memory stored within the time window, store NOTHING and report the
-        // near-duplicate hash — byte-identical to the live Python behavior.
+        // Semantic dedup (enabled by default). Skipped when the caller signals an
+        // incremental save (conversation_id set) or for session memories
+        // (memory_type == "session"); exact-hash dedup above is always enforced.
+        // When the incoming embedding is >= threshold cosine-similar to a memory
+        // stored within the time window, store NOTHING and report the near-duplicate
+        // hash.
         let skip_semantic_dedup = args.conversation_id.is_some()
             || args.memory_type.as_deref() == Some("session");
         if self.semantic_dedup_enabled && !skip_semantic_dedup {
@@ -407,8 +407,8 @@ impl Storage {
             let max_distance = 1.0 - self.semantic_dedup_threshold;
             let cutoff = now_epoch() - self.semantic_dedup_time_window_hours * 3600.0;
             let query_blob = vec_to_blob(embedding);
-            // Brute-force scalar cosine distance over recent live rows (the exact
-            // Python `_check_semantic_duplicate` query — NOT the vec0 KNN MATCH).
+            // Brute-force scalar cosine distance over recent live rows (NOT the
+            // vec0 KNN MATCH) — the candidate set is bounded by the time window.
             let dup: Option<(String, f64)> = conn
                 .query_row(
                     "SELECT m.content_hash,
@@ -430,8 +430,9 @@ impl Storage {
             }
         }
 
-        // tags: Python joins memory.tags with "," (empty -> ""). memory_type default
-        // is applied at the tool layer. metadata serialized as compact JSON ("{}" empty).
+        // tags are stored as a comma-joined string (empty -> ""). memory_type
+        // default is applied at the tool layer. metadata is stored as compact JSON
+        // ("{}" when empty).
         let tags_str = crate::models::tags_to_csv(&args.tags);
         let metadata_str = if args.metadata.is_null()
             || (args.metadata.is_object() && args.metadata.as_object().unwrap().is_empty())
@@ -448,8 +449,8 @@ impl Storage {
         // Steps 2-4 atomically (FTS triggers fire automatically; never write vec0
         // shadow / FTS tables directly).
         let tx = conn.transaction()?;
-        // Step 2: tombstone purge so the UNIQUE constraint allows re-insert (#644),
-        // plus delete the orphaned memory_embeddings row for the old id.
+        // Step 2: tombstone purge so the content_hash UNIQUE constraint allows the
+        // re-insert, plus delete the orphaned memory_embeddings row for the old id.
         {
             let old_id: Option<i64> = tx
                 .query_row(
@@ -467,7 +468,7 @@ impl Storage {
             }
         }
 
-        // Step 3: insert the memory row (9 cols, exactly the Python order).
+        // Step 3: insert the memory row (9 cols).
         tx.execute(
             "INSERT INTO memories (
                 content_hash, content, tags, memory_type,
@@ -497,7 +498,7 @@ impl Storage {
         Ok(StoreOutcome::Stored { content_hash: hash })
     }
 
-    /// Semantic KNN search. The primary query — exact Python SQL:
+    /// Semantic KNN search — the primary query:
     /// ```sql
     /// SELECT m.content_hash, m.content, m.tags, m.memory_type, m.metadata,
     ///        m.created_at, m.updated_at, m.created_at_iso, m.updated_at_iso, e.distance
@@ -515,7 +516,7 @@ impl Storage {
     pub fn search_semantic(&self, q: &SearchQuery, query_embedding: &[f32]) -> Result<Vec<SearchHit>> {
         let conn = self.conn.lock().unwrap();
 
-        // Count embeddings; an empty table can't be searched (Python guards this).
+        // Count embeddings; an empty table can't be KNN-searched.
         let embedding_count: i64 =
             conn.query_row("SELECT COUNT(*) FROM memory_embeddings", [], |r| r.get(0))?;
         if embedding_count == 0 {
@@ -523,14 +524,14 @@ impl Storage {
         }
 
         // k_value: when tags/time filters are present we must scan more candidates
-        // since membership is orthogonal to similarity (Python parity). Cap at MAX_KNN_K.
+        // since membership is orthogonal to similarity. Cap at MAX_KNN_K.
         let k_value: i64 = if !q.tags.is_empty() || q.after.is_some() || q.before.is_some() {
             embedding_count.min(MAX_KNN_K as i64)
         } else {
             (q.limit as i64).min(MAX_KNN_K as i64)
         };
 
-        // Build the dynamic filter clauses + bound params, in the exact Python order:
+        // Build the dynamic filter clauses + bound params, in binding order:
         //   ?1 = query blob, ?2 = k, [tag params], [time params], [n_results].
         let blob = vec_to_blob(query_embedding);
         let mut params: Vec<rusqlite::types::Value> = Vec::new();
@@ -543,11 +544,9 @@ impl Storage {
             " AND (m.superseded_by IS NULL OR m.superseded_by = '')"
         };
 
-        // Tag filter: ANY-match via LIKE on the comma-wrapped tags column.
-        // (Python's retrieve() only does ANY-match at SQL level; ALL is applied
-        // by the service layer, but the live search_memories path for semantic
-        // passes tags through to retrieve which is ANY — we replicate ANY here
-        // and apply ALL post-filter below to match search_memories exactly.)
+        // Tag filter: ANY-match via LIKE on the comma-wrapped tags column. Only
+        // ANY-match is expressible at the SQL level here; ALL-match is applied as a
+        // post-filter on the returned rows.
         let mut tag_conditions = String::new();
         if !q.tags.is_empty() {
             let clauses: Vec<String> = q
@@ -608,8 +607,7 @@ impl Storage {
     }
 
     /// Dispatch on [`SearchMode`]. `Semantic`/`Hybrid`/`Ranked` use KNN; `Exact`
-    /// uses substring match (FTS-free, matching the Python `get_by_exact_content`
-    /// behavior the unified search uses for `mode=exact`).
+    /// uses a case-insensitive substring match (no FTS) for `mode=exact`.
     pub fn search(&self, q: &SearchQuery, query_embedding: Option<&[f32]>) -> Result<Vec<SearchHit>> {
         let mut hits = match q.mode {
             SearchMode::Exact => {
@@ -632,21 +630,18 @@ impl Storage {
         Ok(hits)
     }
 
-    /// Exact search (`mode: exact`). The live `search_memories(mode="exact")` path
-    /// uses `get_by_exact_content` — a case-insensitive substring match on content —
-    /// NOT FTS5/BM25 (BM25 is only used by hybrid's fusion). We reproduce that:
-    /// `LIKE '%query%'` (case-insensitive), soft-delete filtered ONLY (NOT
-    /// superseded — get_by_exact_content does not filter superseded), relevance 1.0,
-    /// ORDER BY created_at DESC.
+    /// Exact search (`mode: exact`): a case-insensitive substring match on content
+    /// (`LIKE '%query%'`), NOT FTS5/BM25 (BM25 is only used by hybrid's fusion).
+    /// Filters soft-deleted rows ONLY — superseded live rows are intentionally
+    /// surfaced. Relevance is fixed at 1.0, ORDER BY created_at DESC.
     pub fn search_fts(&self, query: &str, q: &SearchQuery) -> Result<Vec<SearchHit>> {
         if query.is_empty() {
             return Ok(Vec::new());
         }
         let conn = self.conn.lock().unwrap();
-        // NOTE: the Python `get_by_exact_content` (the path mode=exact reproduces)
-        // filters ONLY `deleted_at IS NULL` — it does NOT filter superseded rows
-        // (unlike the semantic path). So exact search must surface superseded
-        // live rows too; do not add a superseded_filter here.
+        // NOTE: exact search filters ONLY `deleted_at IS NULL` — unlike the
+        // semantic path, it does NOT filter superseded rows, so superseded live
+        // rows are surfaced too. Do not add a superseded_filter here.
         let sql = "SELECT m.content_hash, m.content, m.tags, m.memory_type, m.metadata,
                     m.created_at, m.updated_at, m.created_at_iso, m.updated_at_iso,
                     0.0 AS distance
@@ -661,7 +656,7 @@ impl Storage {
             rusqlite::params![pattern, q.limit as i64],
             |row| {
                 let mut hit = row_to_hit(row)?;
-                // Exact matches get relevance 1.0 in the live service.
+                // Exact matches get a fixed relevance of 1.0.
                 hit.distance = 0.0;
                 hit.relevance_score = 1.0;
                 Ok(hit)
@@ -800,7 +795,7 @@ impl Storage {
         let offset = (q.page.saturating_sub(1)) * q.page_size;
 
         // Build shared WHERE clause + params (deleted_at IS NULL always).
-        // NOTE: get_all_memories does NOT filter superseded — only soft-deleted.
+        // NOTE: list does NOT filter superseded rows — only soft-deleted.
         let mut conditions: Vec<String> = vec!["m.deleted_at IS NULL".to_string()];
         let mut params: Vec<rusqlite::types::Value> = Vec::new();
 
@@ -825,8 +820,7 @@ impl Storage {
         }
         let where_clause = conditions.join(" AND ");
 
-        // total count (count_all_memories uses bare `tags`/`memory_type` aliases,
-        // but the column set is identical; alias prefix is harmless here).
+        // total count over the same filtered set.
         let count_sql = format!("SELECT COUNT(*) FROM memories m WHERE {where_clause}");
         let total: i64 = conn.query_row(
             &count_sql,
@@ -878,11 +872,9 @@ impl Storage {
     ///   * dry_run -> count + collect hashes, no UPDATE.
     /// Returns a [`DeleteOutcome`] (count, matched hashes, storage message, single-hash flag).
     pub fn delete(&self, q: &DeleteQuery) -> Result<DeleteOutcome> {
-        // Validate tag_match (Python rejects anything but any/all; our enum can't
-        // express invalid, so this is implicitly satisfied).
+        // tag_match is restricted to any/all by its enum, so no validation needed.
 
-        // Case 1: single hash (ignores all other filters). Mirrors the unified
-        // delete_memories content_hash branch + storage.delete() message.
+        // Case 1: single hash (ignores all other filters).
         if let Some(hash) = &q.content_hash {
             let conn = self.conn.lock().unwrap();
             if q.dry_run {
@@ -918,8 +910,8 @@ impl Storage {
                     "Memory with hash {hash} not found"
                 )));
             };
-            // Guard against sqlite-vec issues on the embedding delete (#1037):
-            // tolerate failure (soft-delete still wins) but surface it instead of swallowing.
+            // The embedding delete can fail on some sqlite-vec versions; tolerate
+            // it (the soft-delete still wins) but log it rather than swallow it.
             if let Err(e) = conn.execute("DELETE FROM memory_embeddings WHERE rowid = ?1", [id]) {
                 tracing::warn!(hash = %hash, error = %e, "failed to delete embedding row during soft-delete");
             }
@@ -1002,9 +994,8 @@ impl Storage {
         let hashes: Vec<String> = matched.iter().map(|(_, h)| h.clone()).collect();
         let n = matched.len();
 
-        // Dry-run filter delete: the generic Python `delete_memories` dry-run path
-        // (base.py:646) returns "Would delete N memories" — the handler then appends
-        // "\n\nWould delete N memories\nHashes: ...".
+        // Dry-run filter delete: report "Would delete N memories"; the handler then
+        // appends "\n\nWould delete N memories\nHashes: ...".
         if q.dry_run {
             return Ok(DeleteOutcome {
                 deleted_count: n,
@@ -1032,12 +1023,12 @@ impl Storage {
             )?;
         }
 
-        // Real filter delete base message — mirror Python exactly:
-        //   * tag-only ANY-match takes the optimized `delete_by_tags` path
-        //     (sqlite_vec.py): "Successfully deleted N memories matching M tag(s)"
+        // Real filter delete base message. Callers grep this text, so the exact
+        // wording matters:
+        //   * tag-only ANY-match: "Successfully deleted N memories matching M tag(s)"
         //     when N>0, else "No memories found matching any of the M tags".
-        //   * every other filter combo (time-only, tags+time, ALL-match) falls to
-        //     the generic base.py path: "Successfully deleted N memories".
+        //   * every other filter combo (time-only, tags+time, ALL-match):
+        //     "Successfully deleted N memories".
         // The handler appends "\n\nDeleted N memories" in all cases.
         let tag_only_any = !q.tags.is_empty()
             && q.before.is_none()
@@ -1067,8 +1058,8 @@ impl Storage {
     /// Returns a human-readable message (the handler returns it verbatim).
     pub fn update(&self, content_hash: &str, updates: &serde_json::Value, _versioned: bool) -> Result<String> {
         // Versioned supersede is handled at the tool layer (it needs an embedding
-        // for the new content); this storage method does the in-place metadata path,
-        // mirroring `update_memory_metadata` with preserve_timestamps=True (default).
+        // for the new content); this storage method does the in-place metadata path
+        // and preserves timestamps unless a structural field changes (see below).
         let conn = self.conn.lock().unwrap();
 
         // Read current row (live only).
@@ -1108,8 +1099,8 @@ impl Storage {
         let mut new_type = cur_type;
         let mut new_meta: serde_json::Map<String, serde_json::Value> = match cur_meta {
             Some(s) if !s.is_empty() => serde_json::from_str(&s).unwrap_or_else(|e| {
-                // Parity with Python `_safe_json_loads`: corrupt stored metadata
-                // falls back to empty, but the corruption is LOGGED (not silent).
+                // Corrupt stored metadata falls back to an empty map, but the
+                // corruption is LOGGED (not silently dropped).
                 tracing::warn!(
                     content_hash = %content_hash,
                     error = %e,
@@ -1124,8 +1115,7 @@ impl Storage {
         let mut updated_fields: Vec<&str> = Vec::new();
         if let Some(t) = obj.get("tags") {
             // Accept array OR CSV-string form, then normalize_tags (lowercase +
-            // trim + comma->hyphen + dedup) — matching the Python update path
-            // which runs normalize_tags before persisting.
+            // trim + comma->hyphen + dedup) before persisting.
             let raw: Vec<String> = match t {
                 serde_json::Value::Array(arr) => arr
                     .iter()
@@ -1165,8 +1155,8 @@ impl Storage {
             }
         }
 
-        // Timestamps: preserve_timestamps=True default. structural change (tags /
-        // memory_type / content) advances updated_at; pure metadata keeps it.
+        // Timestamps: a structural change (tags / memory_type / content) advances
+        // updated_at; a pure-metadata change preserves it.
         let now = now_epoch();
         let now_iso = epoch_to_iso(now);
         let structural = obj.contains_key("tags")
@@ -1254,9 +1244,9 @@ impl Storage {
             return Ok(Vec::new());
         }
         let conn = self.conn.lock().unwrap();
-        // Recursive CTE for multi-hop BFS over memory_graph, direction = "both",
-        // mirroring the Python _QUERY_TEMPLATE_FIND_CONNECTED exactly. Cycle
-        // prevention via the comma-delimited `path` string + instr().
+        // Recursive CTE for multi-hop BFS over memory_graph, treating edges as
+        // undirected (either endpoint matches). Cycle prevention via the
+        // comma-delimited `path` string + instr().
         let sql = "
 WITH RECURSIVE connected_memories(hash, distance, path) AS (
     SELECT ?1, 0, ?2
@@ -1519,8 +1509,8 @@ fn build_memory(row: &rusqlite::Row) -> rusqlite::Result<Memory> {
 
     let tags = tags_str.as_deref().map(tags_from_csv).unwrap_or_default();
     let metadata: serde_json::Value = match metadata_str.as_deref().filter(|s| !s.is_empty()) {
-        // Parity with Python `_safe_json_loads`: log corrupt metadata instead of
-        // dropping it silently, then fall back to an empty object.
+        // Log corrupt metadata instead of dropping it silently, then fall back to
+        // an empty object.
         Some(s) => serde_json::from_str(s).unwrap_or_else(|e| {
             tracing::warn!(
                 content_hash = %content_hash,
@@ -1549,8 +1539,8 @@ fn build_memory(row: &rusqlite::Row) -> rusqlite::Result<Memory> {
 }
 
 /// Serialize a `&[f32]` to the raw little-endian byte blob sqlite-vec stores
-/// (no header; dim 2560 -> 10240 bytes). Apple Silicon is little-endian so the
-/// cast is a no-op reinterpret. Byte-identical to Python `serialize_float32`.
+/// (no header; dim 2560 -> 10240 bytes). On little-endian hosts the cast is a
+/// no-op reinterpret. This LE layout is part of the on-disk format contract.
 pub fn vec_to_blob(vec: &[f32]) -> &[u8] {
     bytemuck::cast_slice(vec)
 }

@@ -1,21 +1,20 @@
-//! In-memory row + result types mirroring the `memories` table and the unified
-//! search-result dict the Python handlers emit.
+//! In-memory row + result types for the `memories` table and the unified
+//! search-result shape returned by the handlers.
 
 use serde::Serialize;
 
-/// Max length of an individual tag (Python `_MAX_TAG_LENGTH`).
+/// Max length of an individual tag.
 const MAX_TAG_LENGTH: usize = 100;
-/// Max tags per memory (Python `_MAX_TAGS_PER_MEMORY`).
+/// Max tags per memory.
 const MAX_TAGS_PER_MEMORY: usize = 100;
-/// Max length of a tag JSON-array string before treating it as literal (Python `_MAX_JSON_LENGTH`).
+/// Max length of a tag JSON-array string before treating it as a literal tag.
 const MAX_JSON_LENGTH: usize = 4096;
 
-/// Normalize a list of tags exactly like the Python `normalize_tags`
-/// (services/memory_service.py): strip whitespace, replace internal commas with
+/// Normalize a list of tags: strip whitespace, replace internal commas with
 /// hyphens, truncate to `MAX_TAG_LENGTH`, lowercase, drop empties, and dedup
 /// case-insensitively (preserving first-seen order). Caps the total at
-/// `MAX_TAGS_PER_MEMORY`. The lowercase normalization is what makes stored CSVs
-/// and tag filters byte-compatible with the live Python DB.
+/// `MAX_TAGS_PER_MEMORY`. Lowercasing here is what keeps the stored tag CSV and
+/// later tag filters comparable, since filtering matches on the stored bytes.
 pub fn normalize_tags(tags: &[String]) -> Vec<String> {
     let mut seen_lower = std::collections::HashSet::new();
     let mut out = Vec::new();
@@ -24,8 +23,8 @@ pub fn normalize_tags(tags: &[String]) -> Vec<String> {
         if t.is_empty() {
             continue;
         }
-        // CRITICAL: commas would break the CSV LIKE-based search; Python replaces
-        // them with hyphens.
+        // Tags are stored comma-joined and searched with LIKE, so an embedded
+        // comma would split one tag into two; replace it with a hyphen.
         if t.contains(',') {
             t = t.replace(',', "-");
         }
@@ -45,8 +44,8 @@ pub fn normalize_tags(tags: &[String]) -> Vec<String> {
     out
 }
 
-/// Parse a single tag *string* form into a list, mirroring the string branch of
-/// the Python `normalize_tags` BEFORE the per-tag normalization runs:
+/// Split a single tag *string* into raw tokens, before any per-tag
+/// normalization:
 ///   * a leading-`[` JSON array string -> the parsed array elements (or, if the
 ///     string is too long / not valid JSON / not a list, the literal string);
 ///   * a comma-containing string -> comma-split, trimmed, empties dropped;
@@ -84,15 +83,14 @@ pub fn split_tag_string(s: &str) -> Vec<String> {
 }
 
 /// A `tags` argument that accepts EITHER a JSON array of strings OR a single
-/// string (CSV / JSON-array-string / single tag) — exactly like the Python
-/// `normalize_tags` input contract, which the live MCP schema advertises as
-/// `oneOf: [array<string>, string]` and labels the string form "preferred".
+/// string (CSV / JSON-array-string / single tag). The MCP schema advertises this
+/// as `oneOf: [array<string>, string]`.
 ///
 /// Deserializing splits a string form into raw tokens (pre-normalization); the
 /// per-tag lowercase/dedup/comma->hyphen normalization runs later via
 /// [`normalize_tags`] at the resolve site. The custom `JsonSchema` impl emits the
-/// same `oneOf` shape so MCP clients that validate against the advertised schema
-/// accept the CSV-string form (the opencode model routinely sends it).
+/// matching `oneOf` shape so clients validating against the advertised schema
+/// accept the CSV-string form, which agents commonly send.
 #[derive(Debug, Clone, Default)]
 pub struct Tags(pub Option<Vec<String>>);
 
@@ -135,8 +133,8 @@ impl schemars::JsonSchema for Tags {
     }
 
     fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
-        // Mirror the Python `oneOf: [array<string>, string]` tags schema so MCP
-        // clients accept either shape.
+        // Advertise `oneOf: [array<string>, string]` so MCP clients accept
+        // either shape for the tags argument.
         schemars::json_schema!({
             "oneOf": [
                 {
@@ -167,10 +165,11 @@ pub struct Memory {
     pub memory_type: Option<String>,
     /// Parsed from the JSON-string `metadata` column.
     pub metadata: serde_json::Value,
-    /// Unix epoch seconds (`time.time()` float).
+    /// Unix epoch seconds (fractional).
     pub created_at: f64,
     pub updated_at: f64,
-    /// `datetime.utcfromtimestamp(ts).isoformat()+"Z"` (microsecond precision).
+    /// Naive-UTC ISO 8601 with a literal trailing `Z` and microsecond precision
+    /// (see [`epoch_to_iso`]).
     pub created_at_iso: String,
     pub updated_at_iso: String,
 }
@@ -182,12 +181,12 @@ pub struct SearchHit {
     pub memory: Memory,
     /// vec0 cosine distance (0 = identical .. 2 = opposite).
     pub distance: f64,
-    /// `max(0, 1 - distance/2)` — the relevance the Python UI expects.
+    /// `max(0, 1 - distance/2)` — normalizes cosine distance into a 0..1 score.
     pub relevance_score: f64,
 }
 
 impl SearchHit {
-    /// Convert cosine distance to the relevance score used everywhere.
+    /// Convert cosine distance into the 0..1 relevance score.
     pub fn relevance_from_distance(distance: f64) -> f64 {
         (1.0 - distance / 2.0).max(0.0)
     }
@@ -227,18 +226,18 @@ impl TagMatch {
     }
 }
 
-/// Convert an epoch-seconds timestamp to the Python-compatible ISO string:
-/// `datetime.utcfromtimestamp(ts).isoformat() + "Z"` (naive UTC, microsecond
-/// precision, literal trailing `Z`).
+/// Convert an epoch-seconds timestamp to a naive-UTC ISO 8601 string with a
+/// literal trailing `Z` and microsecond precision.
 ///
-/// Python's `datetime.isoformat()` drops the fractional part entirely when the
-/// microsecond component is exactly 0 (e.g. `2024-01-01T00:00:00Z`), otherwise
-/// it emits exactly 6 fractional digits (e.g. `...:00.123456Z`). We reproduce
-/// that branch precisely so stored ISO strings round-trip identically.
+/// The fractional part is omitted entirely when the microsecond component is
+/// exactly 0 (e.g. `2024-01-01T00:00:00Z`), otherwise exactly 6 fractional
+/// digits are emitted (e.g. `...:00.123456Z`). This is the on-disk format for
+/// the `*_iso` columns, so the two branches must be reproduced exactly for
+/// stored strings to round-trip.
 pub fn epoch_to_iso(ts: f64) -> String {
     use chrono::{DateTime, Timelike, Utc};
-    // utcfromtimestamp truncates toward the epoch the same way from_timestamp
-    // splits secs/nanos; build a naive-UTC datetime then format.
+    // Split the timestamp into whole seconds (truncated toward the epoch) and
+    // nanoseconds, then build a UTC datetime to format.
     let secs = ts.floor() as i64;
     let nanos = ((ts - ts.floor()) * 1_000_000_000.0).round() as u32;
     let dt: DateTime<Utc> =
@@ -247,23 +246,22 @@ pub fn epoch_to_iso(ts: f64) -> String {
     if micros == 0 {
         dt.format("%Y-%m-%dT%H:%M:%S").to_string() + "Z"
     } else {
-        // %.6f yields a leading dot + 6 digits → matches isoformat()'s ".ffffff".
+        // Emit a dot plus exactly 6 fractional digits.
         format!("{}.{:06}Z", dt.format("%Y-%m-%dT%H:%M:%S"), micros)
     }
 }
 
 /// Join tags into the comma-separated TEXT column representation.
 ///
-/// NOTE: matches the Python `store` path exactly — `",".join(memory.tags) if
-/// memory.tags else ""`. The default `"untagged"` is applied by `Memory.__post_init__`
-/// BEFORE store, so the empty case here is "" (the post-init default is handled
-/// at the tool layer, mirroring where Python normalizes tags).
+/// Empty tags join to `""` here; the `"untagged"` default is applied earlier at
+/// the tool layer (where tags are normalized), so this function never sees the
+/// empty-default case in practice.
 pub fn tags_to_csv(tags: &[String]) -> String {
     tags.join(",")
 }
 
-/// Split the comma-separated `tags` column back into a `Vec<String>`.
-/// Mirrors Python `[t.strip() for t in tags_str.split(",") if t.strip()]`.
+/// Split the comma-separated `tags` column back into a `Vec<String>`,
+/// trimming each token and dropping empties.
 pub fn tags_from_csv(csv: &str) -> Vec<String> {
     if csv.is_empty() {
         return Vec::new();

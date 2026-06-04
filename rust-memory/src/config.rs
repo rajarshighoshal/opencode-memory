@@ -1,24 +1,23 @@
 //! Runtime configuration, resolved from environment + argv scope.
 //!
-//! Mirrors the `memory-mcp` bash wrapper's env contract so the Rust binary is a
-//! drop-in: same `MCP_MEMORY_SQLITE_PATH`, same embedding env vars, same
-//! `global | project` scope argument.
+//! The contract is fixed by the `memory-mcp` launch wrapper: the DB location comes
+//! from `MCP_MEMORY_SQLITE_PATH`, embedding settings from the `MCP_EXTERNAL_EMBEDDING_*`
+//! vars, and the store scope from a single `global | project` argv token.
 
 use std::path::PathBuf;
 
-/// Server name advertised in the MCP `initialize` response. The Python low-level
-/// server uses `Server(SERVER_NAME)` with `SERVER_NAME = "memory"` (config.py:290),
-/// so we advertise the same name for byte-identical client negotiation.
+/// Server name advertised in the MCP `initialize` response. Clients are configured
+/// against this exact name, so it must stay `"memory"`.
 pub const SERVER_NAME: &str = "memory";
 
-/// Fixed embedding dimension of the existing vec0 tables (`FLOAT[2560]`).
+/// Fixed embedding dimension of the vec0 tables (`FLOAT[2560]`); embeddings must
+/// match this width to be stored.
 pub const EMBEDDING_DIM: usize = 2560;
 
-/// vec0 KNN hard cap (`_SQLITE_VEC_MAX_KNN_K` in the Python impl).
+/// Upper bound sqlite-vec enforces on the `k` of a KNN query.
 pub const MAX_KNN_K: usize = 4096;
 
-/// Two-tier scope, selected by argv\[1\] (`global` or `project`), exactly like the
-/// `memory-mcp` wrapper.
+/// Two-tier scope, selected by argv\[1\] (`global` or `project`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scope {
     /// Cross-project user-level store: `~/.config/opencode/memory/global.db`.
@@ -28,8 +27,8 @@ pub enum Scope {
 }
 
 impl Scope {
-    /// Parse the argv scope token. Returns `None` for anything but `global`/`project`
-    /// (the wrapper exits 64 on bad usage).
+    /// Parse the argv scope token. Returns `None` for anything but `global`/`project`,
+    /// which the caller treats as a usage error.
     pub fn parse(arg: &str) -> Option<Self> {
         match arg {
             "global" => Some(Scope::Global),
@@ -39,22 +38,23 @@ impl Scope {
     }
 }
 
-/// Embedding-client configuration. Defaults match the live infra (port 11434,
-/// NOT the wrapper's stale :8585 default).
+/// Embedding-client configuration. Defaults target the local llama.cpp server on
+/// port 11434.
 #[derive(Debug, Clone)]
 pub struct EmbedConfig {
     /// `MCP_EXTERNAL_EMBEDDING_URL`, default `http://127.0.0.1:11434/v1/embeddings`.
     pub url: String,
-    /// `MCP_EXTERNAL_EMBEDDING_MODEL`, default `qwen3-embedding-4b` (value cosmetic — llama.cpp serves the loaded GGUF).
+    /// `MCP_EXTERNAL_EMBEDDING_MODEL`, default `qwen3-embedding-4b`. The value is
+    /// cosmetic — llama.cpp serves whichever GGUF it was loaded with.
     pub model: String,
     /// `MCP_EXTERNAL_EMBEDDING_API_KEY`, optional Bearer token.
     pub api_key: Option<String>,
-    /// Absolute path to `llama-embed.sh` for lazy-ensure self-heal. Resolved from
-    /// `MEMORY_EMBED_ENSURE` or next to the binary.
+    /// Absolute path to `llama-embed.sh`, run to start the embedding server on demand
+    /// if it isn't already up. Resolved from `MEMORY_EMBED_ENSURE` or next to the binary.
     pub ensure_script: Option<PathBuf>,
-    /// Per-request timeout; >= ~40s to absorb cold model load on the first call.
+    /// Per-request timeout; kept >= ~40s so the first call can absorb a cold model load.
     pub timeout_secs: u64,
-    /// Batch size for `encode` (Python uses 32; keep identical for parity).
+    /// Number of inputs sent per embedding request.
     pub batch_size: usize,
 }
 
@@ -72,19 +72,18 @@ pub struct Config {
 impl Config {
     /// Resolve full config from the scope arg + environment.
     ///
-    /// Honors an explicit absolute `MCP_MEMORY_SQLITE_PATH` (wins, no anchoring);
-    /// otherwise derives the path from scope:
-    ///   * Global  -> `$MCP_MEMORY_SQLITE_PATH || ~/.config/opencode/memory/global.db`
+    /// An explicit absolute `MCP_MEMORY_SQLITE_PATH` always wins (used verbatim, no
+    /// anchoring); otherwise the path is derived from scope:
+    ///   * Global  -> `~/.config/opencode/memory/global.db`
     ///   * Project -> project-root walk (git toplevel, then marker walk, then CWD)
-    ///                + `/.opencode-memory/project.db`, matching the wrapper.
+    ///                + `/.opencode-memory/project.db`.
     ///
-    /// In practice the `memory-mcp` wrapper already exports the resolved
-    /// `MCP_MEMORY_SQLITE_PATH`, so the project-root walk here is a fallback for
-    /// direct invocation.
+    /// The launch wrapper normally exports a resolved `MCP_MEMORY_SQLITE_PATH`, so the
+    /// project-root walk here only runs when the binary is invoked directly.
     pub fn from_env(scope: Scope) -> crate::error::Result<Self> {
         let home = std::env::var_os("HOME").map(PathBuf::from);
 
-        // DB path resolution mirrors the memory-mcp wrapper:
+        // DB path resolution:
         //   * An explicit ABSOLUTE MCP_MEMORY_SQLITE_PATH always wins (no anchoring).
         //   * Otherwise: Global -> ~/.config/opencode/memory/global.db;
         //               Project -> <project-root>/.opencode-memory/project.db.
@@ -108,7 +107,7 @@ impl Config {
             },
         };
 
-        // Embedding config — port-11434 defaults (NOT the wrapper's stale :8585).
+        // Embedding config — defaults to the local llama.cpp server on port 11434.
         let url = std::env::var("MCP_EXTERNAL_EMBEDDING_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:11434/v1/embeddings".to_string());
         let model = std::env::var("MCP_EXTERNAL_EMBEDDING_MODEL")
@@ -151,8 +150,8 @@ impl Config {
         })
     }
 
-    /// Walk from `cwd` to the project root (git toplevel, else nearest ancestor
-    /// holding a project marker, else `cwd`). Mirrors the wrapper's detection.
+    /// Walk from `cwd` to the project root: git toplevel if available, else the
+    /// nearest ancestor holding a project marker, else `cwd` itself.
     pub fn find_project_root(cwd: &std::path::Path) -> PathBuf {
         // 1. git toplevel
         if let Ok(out) = std::process::Command::new("git")

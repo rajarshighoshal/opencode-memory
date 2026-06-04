@@ -1,6 +1,6 @@
-//! Per-tool output-string formatting. These templates are load-bearing for the
-//! drop-in: callers parse the prose, so they must match the Python handlers
-//! character-for-character where feasible.
+//! Per-tool output-string formatting. These templates are load-bearing:
+//! callers parse the prose, so the exact wording and layout are part of the
+//! tool contract and must not change casually.
 
 use crate::models::SearchHit;
 
@@ -9,29 +9,29 @@ pub fn store_ok(hash: &str) -> String {
     format!("Memory stored successfully (hash: {hash})")
 }
 
-/// `memory_store` exact-duplicate. The Python `store_memory` returns
-/// `success=False` with `"Duplicate content detected (exact match)"`, which the
-/// store handler surfaces as `"Error storing memory: <error>"`.
+/// `memory_store` exact-duplicate rejection. The store handler surfaces a failed
+/// store as `"Error storing memory: <error>"`; here the error is
+/// `"Duplicate content detected (exact match)"`.
 pub fn store_duplicate(_hash: &str) -> String {
     "Error storing memory: Duplicate content detected (exact match)".to_string()
 }
 
-/// `memory_store` semantic-duplicate. The Python storage returns `success=False`
-/// with `"Duplicate content detected (semantically similar to <hash>)"`, which the
-/// store handler surfaces as `"Error storing memory: <error>"`.
+/// `memory_store` semantic-duplicate rejection. The store handler surfaces a failed
+/// store as `"Error storing memory: <error>"`; here the error names the existing
+/// near-match: `"Duplicate content detected (semantically similar to <hash>)"`.
 pub fn store_semantic_duplicate(existing_hash: &str) -> String {
     format!(
         "Error storing memory: Duplicate content detected (semantically similar to {existing_hash})"
     )
 }
 
-/// `memory_search` result block, reproducing `handle_memory_search` exactly.
+/// `memory_search` result block.
 ///
 /// Header: `"Found <total> memories"` + `" (mode: <mode>)"` + (if query non-empty)
 /// `" for query: '<q>'"`. Then `header + "\n\n" + "\n\n".join(results)` where each
 /// result is `"<i>. <content>\n   Hash: <hash>\n   Created: <created_at>[ [tags]]"`.
-/// `created_at` is `created_at_iso` (falling back to the float created_at as a
-/// string when iso is empty, matching `m.get('created_at_iso') or str(...)`).
+/// `created_at` uses the ISO timestamp, falling back to the raw float timestamp
+/// rendered as a string when the ISO field is empty.
 ///
 /// Empty: `"No memories found"` + (if query non-empty) `" for query: '<q>'"`.
 pub fn search_results(query: &str, mode: &str, hits: &[SearchHit]) -> String {
@@ -78,12 +78,12 @@ pub fn search_results(query: &str, mode: &str, hits: &[SearchHit]) -> String {
     format!("{}\n\n{}", header, results.join("\n\n"))
 }
 
-/// `memory_delete` message, reproducing the unified `handle_memory_delete`.
+/// `memory_delete` message.
 ///
-/// Builds `response = result["message"]` then:
-///   * dry_run -> `+ "\n\nWould delete N memories"` and, if N>0,
-///     `+ "\nHashes: <h1, h2, h3, h4, h5>"` (first 5) + (if N>5) `" ... and <N-5> more"`.
-///   * else -> `+ "\n\nDeleted N memories"`.
+/// Starts from the storage-layer message and appends:
+///   * dry_run -> `"\n\nWould delete N memories"` and, if N>0,
+///     `"\nHashes: <h1, h2, h3, h4, h5>"` (first 5) + (if N>5) `" ... and <N-5> more"`.
+///   * else -> `"\n\nDeleted N memories"`.
 /// `base_message` is the storage-layer message (e.g. `"Successfully deleted memory <h>"`).
 pub fn delete_msg(n: usize, hashes: &[String], dry_run: bool, base_message: &str) -> String {
     let mut response = base_message.to_string();
@@ -179,7 +179,8 @@ mod tests {
     #[test]
     fn delete_dry_run_truncates_hashes() {
         let hashes: Vec<String> = (0..7).map(|i| format!("h{i}")).collect();
-        // Filter dry-run base message is "Would delete N memories" (Python base.py:646).
+        // For tag/filter deletes the dry-run base message is "Would delete N memories",
+        // so it appears twice once delete_msg appends its own dry-run line.
         let out = delete_msg(7, &hashes, true, "Would delete 7 memories");
         assert_eq!(
             out,

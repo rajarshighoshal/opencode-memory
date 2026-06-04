@@ -1,16 +1,15 @@
-//! content_hash contract — MUST match the Python impl exactly for dedup and
-//! `memory_graph` source/target hash compatibility.
+//! content_hash contract — the stable identity used for dedup and for
+//! `memory_graph` source/target hash matching. Stored hashes must stay
+//! consistent across versions, so the normalization here is fixed:
 //!
-//! Python (`utils/hashing.py`):
-//! `content_hash = sha256(content.strip().lower().encode("utf-8")).hexdigest()`
-//! — lowercase hex, 64 chars, identity is content-only (tags/type/metadata do
-//! NOT affect the hash).
+//! `content_hash = sha256(content.trim().to_lowercase())` as 64-char lowercase
+//! hex. Identity is content-only — tags, type, and metadata do NOT affect the
+//! hash.
 //!
-//! Rust equivalent: `hex::encode(Sha256::digest(content.trim().to_lowercase().as_bytes()))`.
-//! Note: Python `str.lower()` and Rust `to_lowercase()` are both Unicode-aware
-//! and agree for ASCII/typical memory text; they can differ on exotic
-//! locale-specific characters (e.g. Turkish dotless i) — acceptable for this
-//! single-user English workload.
+//! Note: `to_lowercase()` is Unicode-aware. It agrees with itself for ASCII and
+//! typical memory text but can fold exotic locale-specific characters (e.g.
+//! Turkish dotless i) differently than a naive ASCII lowercase — acceptable for
+//! this single-user English workload.
 
 use sha2::{Digest, Sha256};
 
@@ -33,9 +32,9 @@ mod tests {
         assert_eq!(h, content_hash("hello world"));
     }
 
-    /// Parity with the Python `generate_content_hash`:
-    /// `sha256(content.strip().lower().encode("utf-8")).hexdigest()`.
-    /// Reference values produced by running the live Python helper.
+    /// Locks in the exact hash values for known inputs. These are stored as
+    /// memory identities, so any change to the normalization or digest would
+    /// break dedup and graph hash matching against existing data.
     #[test]
     fn hash_matches_python_reference() {
         assert_eq!(
