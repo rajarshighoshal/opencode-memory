@@ -40,6 +40,7 @@ pub fn test_config(scope: Scope) -> Config {
             ensure_script: None,
             timeout_secs: 30,
             batch_size: 32,
+            embedding_dim: crate::config::DEFAULT_EMBEDDING_DIM,
         },
     }
 }

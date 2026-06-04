@@ -32,7 +32,7 @@
 //!     -- rowid == memories.id (application convention, NOT a FK)
 //!   memory_content_fts USING fts5(content, content='memories', tokenize='trigram')
 
-use crate::config::{Config, EMBEDDING_DIM, MAX_KNN_K};
+use crate::config::{Config, MAX_KNN_K};
 use crate::error::{MemoryError, Result};
 use crate::hashing::content_hash;
 use crate::models::{epoch_to_iso, tags_from_csv, Memory, SearchHit, SearchMode, TagMatch};
@@ -134,6 +134,9 @@ pub fn register_vec_extension() -> Result<()> {
 /// handles one request at a time anyway, so contention is negligible.
 pub struct Storage {
     conn: Mutex<Connection>,
+    /// Embedding width this DB uses — the existing vec0 table's width, or the
+    /// configured dim for a freshly-created DB.
+    embedding_dim: usize,
     /// Semantic-dedup config, read from env at open time
     /// (`MCP_SEMANTIC_DEDUP_ENABLED` default true, `MCP_SEMANTIC_DEDUP_THRESHOLD`
     /// 0.85, `MCP_SEMANTIC_DEDUP_TIME_WINDOW_HOURS` 24).
@@ -268,9 +271,11 @@ pub struct DbStats {
 /// Create the canonical schema if absent so a brand-new DB is usable. Idempotent
 /// — every statement is `IF NOT EXISTS`, so it is a no-op on existing DBs and
 /// never alters them. The vec0 extension must already be registered (main does it
-/// before open). Schema is dim 2560 with an FTS5 trigram external-content mirror
-/// plus sync triggers and the association-graph table.
-fn ensure_schema(conn: &Connection) -> Result<()> {
+/// before open). The vec0 embedding table is created `dim` wide (a fresh DB takes
+/// the configured dim); the rest is an FTS5 trigram external-content mirror plus
+/// sync triggers and the association-graph table.
+fn ensure_schema(conn: &Connection, dim: usize) -> Result<()> {
+    // Width-independent tables + indexes.
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS metadata (
             key TEXT PRIMARY KEY,
@@ -297,11 +302,19 @@ fn ensure_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_content_hash ON memories(content_hash);
         CREATE INDEX IF NOT EXISTS idx_created_at ON memories(created_at);
         CREATE INDEX IF NOT EXISTS idx_memory_type ON memories(memory_type);
-        CREATE INDEX IF NOT EXISTS idx_deleted_at ON memories(deleted_at);
-        CREATE VIRTUAL TABLE IF NOT EXISTS memory_embeddings USING vec0(
-            content_embedding FLOAT[2560] distance_metric=cosine
-        );
-        CREATE VIRTUAL TABLE IF NOT EXISTS memory_content_fts USING fts5(
+        CREATE INDEX IF NOT EXISTS idx_deleted_at ON memories(deleted_at);",
+    )?;
+    // Embedding table — its width is fixed at creation, so it carries `dim`.
+    conn.execute(
+        &format!(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS memory_embeddings \
+             USING vec0(content_embedding FLOAT[{dim}] distance_metric=cosine)"
+        ),
+        [],
+    )?;
+    // FTS mirror + sync triggers + association graph.
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS memory_content_fts USING fts5(
             content,
             content='memories',
             content_rowid='id',
@@ -350,17 +363,50 @@ impl Storage {
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         // Verify the vec0 extension is live (proves register_vec_extension ran).
         let _v: String = conn.query_row("SELECT vec_version()", [], |r| r.get(0))?;
+        // Embedding width: an existing DB keeps the width its vec0 table was created
+        // with (parsed from its `FLOAT[N]` definition); a fresh DB uses the configured
+        // dim. Warn if a non-empty DB's width disagrees with MCP_EXTERNAL_EMBEDDING_DIM.
+        let existing_dim: Option<usize> = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name = 'memory_embeddings'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+            .and_then(|sql| {
+                sql.split("FLOAT[")
+                    .nth(1)
+                    .and_then(|s| s.split(']').next())
+                    .and_then(|n| n.trim().parse::<usize>().ok())
+            });
+        let embedding_dim = existing_dim.unwrap_or(cfg.embed.embedding_dim);
+        if let Some(d) = existing_dim {
+            if d != cfg.embed.embedding_dim {
+                tracing::warn!(
+                    db_dim = d,
+                    configured = cfg.embed.embedding_dim,
+                    "existing DB embedding width differs from MCP_EXTERNAL_EMBEDDING_DIM; using the DB's width"
+                );
+            }
+        }
         // Bootstrap the schema for a brand-new DB (no-op on existing DBs). Without
         // this, a freshly created DB would have no `memories` table and every store
         // would fail ("no such table: memories").
-        ensure_schema(&conn)?;
+        ensure_schema(&conn, embedding_dim)?;
         let dedup = SemanticDedupConfig::from_env();
         Ok(Self {
             conn: Mutex::new(conn),
+            embedding_dim,
             semantic_dedup_enabled: dedup.enabled,
             semantic_dedup_threshold: dedup.threshold,
             semantic_dedup_time_window_hours: dedup.time_window_hours,
         })
+    }
+
+    /// The embedding width this DB uses (existing vec0 table's width, or the
+    /// configured dim for a fresh DB).
+    pub fn embedding_dim(&self) -> usize {
+        self.embedding_dim
     }
 
     /// `vec_version()` — for the health check + startup self-test.
@@ -1232,7 +1278,7 @@ impl Storage {
             memories_this_week: this_week as usize,
             database_size_bytes,
             embedding_model: embedding_model.to_string(),
-            embedding_dimension: EMBEDDING_DIM,
+            embedding_dimension: self.embedding_dim,
         })
     }
 
@@ -1576,6 +1622,15 @@ fn normalize_vec(v: &[f32]) -> Option<Vec<f32>> {
 mod tests {
     use super::*;
     use crate::test_util::{open_test_storage, seeded_embed, store_mem};
+
+    /// A fresh DB is created at the configured embedding width, not a hardcoded 2560.
+    #[test]
+    fn fresh_db_honors_configured_dim() {
+        let mut cfg = crate::test_util::test_config(crate::config::Scope::Project);
+        cfg.embed.embedding_dim = 384;
+        let s = Storage::open(&cfg).expect("open with dim 384");
+        assert_eq!(s.embedding_dim(), 384);
+    }
 
     // ––– helpers –––
 

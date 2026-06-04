@@ -24,7 +24,7 @@ Agents forget everything between sessions. This gives them a durable, searchable
 - **sqlite3** CLI *(optional)* — used by `doctor.sh` and the backup helpers
 - macOS or Linux
 
-The default embedding model is **Qwen3-Embedding-4B** (GGUF Q8_0, dim **2560**), auto-downloaded by llama.cpp on first run. A different model works as long as it's also 2560-dim; other dimensions require changing `EMBEDDING_DIM` (and the `vec0` schema) in the source.
+The default embedding model is **Qwen3-Embedding-4B** (GGUF Q8_0, dim **2560**), auto-downloaded by llama.cpp on first run. **To use any other model, point `MCP_EXTERNAL_EMBEDDING_URL`/`MODEL` at it and set `MCP_EXTERNAL_EMBEDDING_DIM` to its width** — e.g. `all-MiniLM` (384), `text-embedding-3-small` (1536), BGE (1024). A freshly-created DB is built at that width; an existing DB keeps the width it was created with (auto-detected on open, with a warning if your configured dim disagrees).
 
 ## Quick start
 
@@ -44,7 +44,7 @@ cd opencode-memory
 - **Claude Code** — run the printed `claude mcp add … -- /path/to/memory-mcp global` (and `project`) commands.
 - **Codex** — merge `configs/codex-config-snippet.toml` into `~/.codex/config.toml`.
 
-Each server needs only four env vars: `MCP_MEMORY_BASE_DIR`, `MCP_MEMORY_SQLITE_PATH`, `MCP_EXTERNAL_EMBEDDING_URL`, `MCP_EXTERNAL_EMBEDDING_MODEL`. Project scope auto-anchors to the repo root, so a relative `MCP_MEMORY_SQLITE_PATH` is fine.
+Each server needs only four env vars: `MCP_MEMORY_BASE_DIR`, `MCP_MEMORY_SQLITE_PATH`, `MCP_EXTERNAL_EMBEDDING_URL`, `MCP_EXTERNAL_EMBEDDING_MODEL` (plus optional `MCP_EXTERNAL_EMBEDDING_DIM` if your model isn't 2560-wide). Project scope auto-anchors to the repo root, so a relative `MCP_MEMORY_SQLITE_PATH` is fine.
 
 ## Search modes (`memory_search` `mode`)
 

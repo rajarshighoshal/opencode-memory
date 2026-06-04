@@ -13,7 +13,7 @@
 //!     capped exponential backoff. A watchdog can stop the server mid-session,
 //!     so ensuring it once at launch is not enough.
 
-use crate::config::{EmbedConfig, EMBEDDING_DIM};
+use crate::config::EmbedConfig;
 use crate::error::EmbedError;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -84,7 +84,7 @@ impl EmbedClient {
         let mut out: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
         for chunk in texts.chunks(self.cfg.batch_size.max(1)) {
             let items = self.post_with_retry(chunk).await?;
-            let ordered = reorder_and_validate(items, chunk.len())?;
+            let ordered = reorder_and_validate(items, chunk.len(), self.cfg.embedding_dim)?;
             out.extend(ordered);
         }
         Ok(out)
@@ -216,8 +216,8 @@ impl EmbedClient {
 
 /// Reorder a chunk's items by their `index` field into a dense `Vec`, validating
 /// no duplicate/missing/out-of-bounds indices and that every vector is exactly
-/// [`EMBEDDING_DIM`] wide and finite.
-fn reorder_and_validate(items: Vec<EmbedItem>, expected_len: usize) -> Result<Vec<Vec<f32>>, EmbedError> {
+/// `dim` wide and finite.
+fn reorder_and_validate(items: Vec<EmbedItem>, expected_len: usize, dim: usize) -> Result<Vec<Vec<f32>>, EmbedError> {
     if items.len() != expected_len {
         return Err(EmbedError::BadResponse(format!(
             "expected {expected_len} embeddings, got {}",
@@ -237,9 +237,9 @@ fn reorder_and_validate(items: Vec<EmbedItem>, expected_len: usize) -> Result<Ve
             return Err(EmbedError::BadResponse(format!("duplicate index {idx}")));
         }
         // Validate dimension + finiteness before accepting.
-        if item.embedding.len() != EMBEDDING_DIM {
+        if item.embedding.len() != dim {
             return Err(EmbedError::DimMismatch {
-                expected: EMBEDDING_DIM,
+                expected: dim,
                 got: item.embedding.len(),
             });
         }

@@ -10,9 +10,10 @@ use std::path::PathBuf;
 /// against this exact name, so it must stay `"memory"`.
 pub const SERVER_NAME: &str = "memory";
 
-/// Fixed embedding dimension of the vec0 tables (`FLOAT[2560]`); embeddings must
-/// match this width to be stored.
-pub const EMBEDDING_DIM: usize = 2560;
+/// Default embedding width for a freshly-created DB's `vec0` table. Override with
+/// `MCP_EXTERNAL_EMBEDDING_DIM` to use a different model; an existing DB keeps the
+/// width it was created with (auto-detected on open).
+pub const DEFAULT_EMBEDDING_DIM: usize = 2560;
 
 /// Upper bound sqlite-vec enforces on the `k` of a KNN query.
 pub const MAX_KNN_K: usize = 4096;
@@ -56,6 +57,9 @@ pub struct EmbedConfig {
     pub timeout_secs: u64,
     /// Number of inputs sent per embedding request.
     pub batch_size: usize,
+    /// Expected embedding width; returned vectors that don't match are rejected.
+    /// Defaults to [`DEFAULT_EMBEDDING_DIM`], overridable via `MCP_EXTERNAL_EMBEDDING_DIM`.
+    pub embedding_dim: usize,
 }
 
 /// Fully resolved configuration for one server process.
@@ -135,6 +139,11 @@ impl Config {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(60);
+        let embedding_dim = std::env::var("MCP_EXTERNAL_EMBEDDING_DIM")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|d| *d > 0)
+            .unwrap_or(DEFAULT_EMBEDDING_DIM);
 
         Ok(Config {
             scope,
@@ -146,6 +155,7 @@ impl Config {
                 ensure_script,
                 timeout_secs,
                 batch_size: 32,
+                embedding_dim,
             },
         })
     }

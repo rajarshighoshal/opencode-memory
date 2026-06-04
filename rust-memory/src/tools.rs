@@ -250,7 +250,7 @@ impl MemoryServer {
     fn provenance_metadata(&self) -> serde_json::Value {
         serde_json::json!({
             "embedding_model": self.config.embed.model,
-            "embedding_dimension": crate::config::EMBEDDING_DIM,
+            "embedding_dimension": self.storage.embedding_dim(),
         })
     }
 
