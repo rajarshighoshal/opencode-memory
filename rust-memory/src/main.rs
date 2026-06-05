@@ -1,10 +1,11 @@
 //! opencode-memory — a single Rust binary providing persistent semantic memory
 //! for AI agents over the Model Context Protocol (MCP).
 //!
-//! A stdio MCP server, invoked as `opencode-memory <global|project>` by the
-//! `memory-mcp` wrapper. Stores memories in SQLite + sqlite-vec and embeds via a
-//! local llama.cpp endpoint. Opens an existing sqlite-vec memory DB with no
-//! migration when one is present.
+//! A self-contained stdio MCP server, invoked as `opencode-memory <global|project>`.
+//! It anchors project memory to the repo root, lazily starts a local llama.cpp
+//! embedding server, and runs weekly maintenance itself — no wrapper or cron
+//! required. Stores memories in SQLite + sqlite-vec and embeds via the llama.cpp
+//! endpoint. Opens an existing sqlite-vec memory DB with no migration when present.
 //!
 //! CRITICAL: stdout is the JSON-RPC transport. ALL logging goes to stderr.
 
@@ -26,6 +27,7 @@ mod embed;
 mod error;
 mod format;
 mod hashing;
+mod maintenance;
 mod models;
 mod storage;
 mod tools;
@@ -54,9 +56,10 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     // CLI subcommand: `opencode-memory consolidate <db-path>` — one-shot
-    // association-graph build, invoked
-    // weekly by the wrapper. No MCP server, no embedding calls (reads stored
-    // embeddings). stdout is a human/cron log here, not the JSON-RPC transport.
+    // association-graph build. The server also runs this weekly on its own (see
+    // `maintenance`); this entrypoint stays for manual/cron use. No MCP server, no
+    // embedding calls (reads stored embeddings). stdout is a human/cron log here,
+    // not the JSON-RPC transport.
     let argv: Vec<String> = std::env::args().collect();
     if argv.get(1).map(String::as_str) == Some("consolidate") {
         let db = argv
@@ -96,6 +99,11 @@ async fn main() -> anyhow::Result<()> {
             "stored memories were embedded with a DIFFERENT model; semantic search across the mismatch will degrade — a re-embed is needed"
         );
     }
+
+    // Weekly self-maintenance (backup / integrity-check + optimize / association-
+    // graph consolidation) on a detached background thread. Each task is stamp-gated
+    // and lock-guarded, so this is a cheap no-op when nothing is due.
+    maintenance::spawn(cfg.db_path.clone());
 
     let embed = Arc::new(EmbedClient::new(cfg.embed.clone())?);
     let config = Arc::new(cfg);

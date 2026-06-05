@@ -1,9 +1,16 @@
-# Merge into ~/.codex/config.toml. Replace {{MEMORY_MCP}}, {{GLOBAL_DIR}}, {{GLOBAL_DB}}
-# with the values install.sh prints. Some Codex versions use `mcp.servers` instead of
-# `mcp_servers` — check `codex --help` or your existing config if the block is ignored.
+# Merge into ~/.codex/config.toml. Replace {{MEMORY_BIN}}, {{GLOBAL_DIR}}, {{GLOBAL_DB}}
+# with the values install.sh prints.
+#
+# {{MEMORY_BIN}} is the opencode-memory binary — `opencode-memory` if on PATH
+# (cargo install / release installer), otherwise its absolute path. The binary is
+# self-contained (repo-root anchoring, on-demand embedding server, weekly maintenance),
+# so the env below is OPTIONAL: each overrides a working default. For a different
+# embedding model set MCP_EXTERNAL_EMBEDDING_MODEL + _DIM (see README).
+# Some Codex versions use `mcp.servers` instead of `mcp_servers` — check `codex --help`
+# or your existing config if the block is ignored.
 
 [mcp_servers.memory-global]
-command = "{{MEMORY_MCP}}"
+command = "{{MEMORY_BIN}}"
 args = ["global"]
 
 [mcp_servers.memory-global.env]
@@ -13,11 +20,9 @@ MCP_EXTERNAL_EMBEDDING_URL = "http://localhost:11434/v1/embeddings"
 MCP_EXTERNAL_EMBEDDING_MODEL = "qwen3-embedding-4b"
 
 [mcp_servers.memory-project]
-command = "{{MEMORY_MCP}}"
+command = "{{MEMORY_BIN}}"
 args = ["project"]
 
 [mcp_servers.memory-project.env]
-MCP_MEMORY_BASE_DIR = "./.opencode-memory"
-MCP_MEMORY_SQLITE_PATH = "./.opencode-memory/project.db"
 MCP_EXTERNAL_EMBEDDING_URL = "http://localhost:11434/v1/embeddings"
 MCP_EXTERNAL_EMBEDDING_MODEL = "qwen3-embedding-4b"

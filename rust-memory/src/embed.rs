@@ -7,15 +7,19 @@
 //! Key behaviors to preserve:
 //!   * Vectors come back ALREADY L2-normalized (‖v‖≈1.0). Do NOT normalize.
 //!   * Batch responses may arrive out of order — reorder by `data[i].index`.
-//!   * dim is fixed at 2560; validated on every response.
-//!   * Lazy ensure: on connection-refused, run `llama-embed.sh ensure` once
-//!     (guarded so concurrent calls don't fan out N starts), then retry with
-//!     capped exponential backoff. A watchdog can stop the server mid-session,
-//!     so ensuring it once at launch is not enough.
+//!   * Vector width is validated on every response against the configured dim.
+//!   * Lazy ensure: on connection-refused, bring the server up ONCE (guarded so
+//!     concurrent calls don't fan out N starts) and block until `/health` answers,
+//!     then retry. The binary starts `llama-server` itself by default — no shell
+//!     script required — falling back to an `ensure_script` override when set. A
+//!     watchdog may stop the server mid-session, so ensuring once at launch is not
+//!     enough.
 
 use crate::config::EmbedConfig;
 use crate::error::EmbedError;
 use serde::{Deserialize, Serialize};
+use std::path::Path;
+use std::time::Duration;
 use tokio::sync::Mutex;
 
 /// Request body. We always send `input` as an array (single = 1-element slice)
@@ -149,7 +153,7 @@ impl EmbedClient {
                 }
                 Err(e) if e.is_connect() => {
                     // Connection refused — the watchdog likely stopped the server.
-                    // Run `llama-embed.sh ensure` ONCE, then retry immediately.
+                    // Bring it up ONCE (blocks until /health is ready), then retry.
                     if !ensured {
                         ensured = true;
                         self.ensure_server().await?;
@@ -190,15 +194,27 @@ impl EmbedClient {
         }))
     }
 
-    /// Run `llama-embed.sh ensure` (blocks up to ~40s polling /health, returns 0
-    /// even on timeout). Guarded by `ensure_lock` so only one runs at a time.
-    /// Best-effort: a non-fatal failure still lets the caller retry the request.
+    /// Bring the embedding server up and block until it answers `/health` (up to
+    /// `ready_timeout_secs`). Guarded by `ensure_lock` so concurrent embed calls
+    /// trigger at most one start. Best-effort: any failure still lets the caller
+    /// retry the request and report `ServerUnavailable` on exhaustion.
+    ///
+    /// Two start paths, in precedence order:
+    ///   1. `ensure_script` (power-user override) — run `<script> ensure`, which
+    ///      owns its own readiness wait, so we don't poll afterward.
+    ///   2. built-in — spawn `llama-server` directly, then poll `/health` here.
+    ///      This is what lets a bare `cargo install` work with no shell scripts.
     async fn ensure_server(&self) -> Result<(), EmbedError> {
         let _guard = self.ensure_lock.lock().await;
+        // Re-check under the lock: a concurrent caller may have already started it.
+        if self.health_ok().await {
+            return Ok(());
+        }
+
         if let Some(ref script) = self.cfg.ensure_script {
-            // Ignore the exit status: `ensure` returns 0 even on its own
-            // readiness timeout, and a spawn failure just means we retry the
-            // request and report ServerUnavailable on exhaustion.
+            // Ignore the exit status: `ensure` returns 0 even on its own readiness
+            // timeout, and a spawn failure just means we retry and report
+            // ServerUnavailable on exhaustion.
             if let Err(e) = tokio::process::Command::new(script)
                 .arg("ensure")
                 .stdin(std::process::Stdio::null())
@@ -209,8 +225,109 @@ impl EmbedClient {
             {
                 tracing::debug!(script = %script.display(), error = %e, "ensure script spawn failed; will retry request");
             }
+            return Ok(());
+        }
+
+        match self.cfg.llama_server {
+            Some(ref bin) => {
+                self.spawn_llama_server(bin);
+                self.wait_until_ready().await;
+            }
+            None => {
+                tracing::warn!(
+                    "embedding server unreachable and no llama-server found (set LLAMA_SERVER, \
+                     put it on PATH, or set MEMORY_EMBED_ENSURE); waiting for an external server"
+                );
+            }
         }
         Ok(())
+    }
+
+    /// `GET /health` with a short timeout; `true` on a 2xx. Used both to skip a
+    /// redundant start and to poll for readiness after one.
+    async fn health_ok(&self) -> bool {
+        let url = format!("http://127.0.0.1:{}/health", self.cfg.embed_port);
+        self.http
+            .get(&url)
+            .timeout(Duration::from_secs(2))
+            .send()
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false)
+    }
+
+    /// Spawn `llama-server` detached with the throughput-tuned embedding flags
+    /// (mirrors the bundled `llama-embed.sh`). The child outlives this call and is
+    /// not reaped — it's a long-running server, managed externally (or by an
+    /// optional idle watchdog). stdio goes to `/tmp/llama-embed.log` for triage.
+    fn spawn_llama_server(&self, bin: &Path) {
+        use std::process::{Command, Stdio};
+        let port = self.cfg.embed_port.to_string();
+        let (out, err) = match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/llama-embed.log")
+        {
+            Ok(f) => match f.try_clone() {
+                Ok(f2) => (Stdio::from(f), Stdio::from(f2)),
+                Err(_) => (Stdio::null(), Stdio::null()),
+            },
+            Err(_) => (Stdio::null(), Stdio::null()),
+        };
+        let spawned = Command::new(bin)
+            .args([
+                "-hf",
+                &self.cfg.embed_repo,
+                "--embedding",
+                "--pooling",
+                "last",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                &port,
+                "-c",
+                "16384",
+                "-b",
+                "8192",
+                "-ub",
+                "2048",
+                "--parallel",
+                "8",
+            ])
+            .stdin(Stdio::null())
+            .stdout(out)
+            .stderr(err)
+            .spawn();
+        match spawned {
+            Ok(_child) => tracing::info!(
+                bin = %bin.display(), repo = %self.cfg.embed_repo, port = %port,
+                "started embedding server (llama-server)"
+            ),
+            Err(e) => {
+                tracing::warn!(bin = %bin.display(), error = %e, "failed to spawn llama-server")
+            }
+        }
+    }
+
+    /// Poll `/health` once a second until ready or `ready_timeout_secs` elapses.
+    /// On timeout we log and return anyway — the caller's retry loop will surface
+    /// `ServerUnavailable` if the server truly never came up.
+    async fn wait_until_ready(&self) {
+        let deadline =
+            tokio::time::Instant::now() + Duration::from_secs(self.cfg.ready_timeout_secs);
+        loop {
+            if self.health_ok().await {
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                tracing::warn!(
+                    timeout_secs = self.cfg.ready_timeout_secs,
+                    "embedding server not ready before timeout; retrying request anyway"
+                );
+                return;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
     }
 }
 

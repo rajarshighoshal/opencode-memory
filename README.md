@@ -19,9 +19,9 @@ Agents forget everything between sessions. This gives them a durable, searchable
 
 ## Requirements
 
-- **Rust** (`cargo`) — <https://rustup.rs>
-- **llama.cpp** (`llama-server` on `PATH`) — `brew install llama.cpp`, or build from source
-- **sqlite3** CLI *(optional)* — used by `doctor.sh` and the backup helpers
+- **Rust** (`cargo`) — <https://rustup.rs> (to build from source)
+- **llama.cpp** (`llama-server` on `PATH`) — `brew install llama.cpp`, or build from source. The binary starts it on demand; you don't run it yourself.
+- **sqlite3** CLI *(optional)* — used by `doctor.sh` and the manual backup helpers
 - macOS or Linux
 
 The default embedding model is **Qwen3-Embedding-4B** (GGUF Q8_0, dim **2560**), auto-downloaded by llama.cpp on first run. **To use any other model, point `MCP_EXTERNAL_EMBEDDING_URL`/`MODEL` at it and set `MCP_EXTERNAL_EMBEDDING_DIM` to its width** — e.g. `all-MiniLM` (384), `text-embedding-3-small` (1536), BGE (1024). A freshly-created DB is built at that width; an existing DB keeps the width it was created with (auto-detected on open, with a warning if your configured dim disagrees).
@@ -34,17 +34,19 @@ cd opencode-memory
 ./install.sh
 ```
 
-`install.sh` builds the Rust server, caches the embedding model, installs the watchdog (macOS launchd), activates the pre-push gate, and prints the config to paste into each CLI. It's idempotent — safe to re-run.
+`install.sh` builds the Rust server, caches the embedding model, installs the optional idle watchdog (macOS launchd), activates the pre-push gate, and prints the config to paste into each CLI. It's idempotent — safe to re-run.
 
 ## Per-CLI setup
 
-`install.sh` prints these with paths filled in. All three point at the same `memory-mcp` launcher with a `global` or `project` argument.
+`install.sh` prints these with paths filled in. All three point at the same `opencode-memory` binary — `opencode-memory` if it's on `PATH`, otherwise its absolute path — with a `global` or `project` argument.
 
 - **opencode** — merge `configs/opencode-snippet.jsonc` into the `mcp` block of `~/.config/opencode/opencode.jsonc`.
-- **Claude Code** — run the printed `claude mcp add … -- /path/to/memory-mcp global` (and `project`) commands.
+- **Claude Code** — run the printed `claude mcp add … -- /path/to/opencode-memory global` (and `project`) commands.
 - **Codex** — merge `configs/codex-config-snippet.toml` into `~/.codex/config.toml`.
 
-Each server needs only four env vars: `MCP_MEMORY_BASE_DIR`, `MCP_MEMORY_SQLITE_PATH`, `MCP_EXTERNAL_EMBEDDING_URL`, `MCP_EXTERNAL_EMBEDDING_MODEL` (plus optional `MCP_EXTERNAL_EMBEDDING_DIM` if your model isn't 2560-wide). Project scope auto-anchors to the repo root, so a relative `MCP_MEMORY_SQLITE_PATH` is fine.
+Because the binary is self-contained, **the command is the only required setting** — every env var is an optional override of a working default (global store under `~/.config/opencode/memory`, embeddings from llama.cpp on `:11434`, dim 2560). Project scope auto-anchors to the repo root, so it needs no path at all. To use a different embedding model, set `MCP_EXTERNAL_EMBEDDING_URL`/`MODEL` and `MCP_EXTERNAL_EMBEDDING_DIM` (its width).
+
+> Older setups can still point at the `memory-mcp` wrapper — it's now a thin shim that just locates and execs the binary.
 
 ## Search modes (`memory_search` `mode`)
 
@@ -68,34 +70,34 @@ Optional recency reweight: set `MCP_RECENCY_HALFLIFE_DAYS=N` to decay relevance 
 
 ## How it works
 
+The whole server is **one self-contained binary** — it anchors project memory, starts its own embedding server, and maintains itself. No wrapper or cron required.
+
 ```
-        ┌──────────────────────────────────────────────┐
-        │  memory-mcp  (per-session launcher)            │
-        │  ├─ ensures the embedding server is up         │
-        │  ├─ anchors the project DB to the repo root    │
-        │  ├─ weekly backup / maintenance / graph build  │
-        │  └─ exec ↓                                     │
-        │     opencode-memory  (Rust MCP server, stdio)  │
-        │     ├─ SQLite + sqlite-vec  (vec0, dim 2560)   │
-        │     └─ embeddings ↓                            │
-        │        llama.cpp  (local, :11434)              │
-        └──────────────────────────────────────────────┘
+        ┌────────────────────────────────────────────────────┐
+        │  opencode-memory  (one self-contained Rust binary)   │
+        │  ├─ anchors the project DB to the repo root          │
+        │  ├─ lazily starts the embedding server on demand     │
+        │  ├─ weekly backup / maintenance / graph build        │
+        │  ├─ SQLite + sqlite-vec  (vec0, cosine, dim 2560)    │
+        │  └─ MCP over stdio   ·   embeddings ↓                │
+        │     llama.cpp  (local, :11434)                       │
+        └────────────────────────────────────────────────────┘
                        ▲  MCP over stdio
             ┌──────────┼──────────┐
         opencode   Claude Code   Codex
 ```
 
-A launchd watchdog (macOS) starts the llama.cpp embedding server only while an agent CLI is running and stops it when idle, so the model isn't resident when you're not working.
+The binary lazy-starts `llama-server` the first time it needs to embed, so nothing is resident until you actually use it. *Optionally*, a launchd watchdog (macOS) adds the reverse — stopping the embedding server when no agent CLI is running — so the model isn't resident between sessions either.
 
 ## Project layout
 
 | Path | Purpose |
 |---|---|
-| `rust-memory/` | the Rust MCP server crate (+ `DESIGN.md`) |
-| `memory-mcp` | per-session launcher every CLI execs |
-| `llama-embed.sh`, `llama-embed-watchdog.sh` | manage the local embedding server |
+| `rust-memory/` | the self-contained Rust MCP server crate (+ `DESIGN.md`) |
+| `memory-mcp` | optional thin compat shim (the binary needs no wrapper; older configs that point here still work) |
+| `llama-embed.sh`, `llama-embed-watchdog.sh` | optional helpers to start / stop-when-idle the embedding server (the binary lazy-starts it on its own) |
 | `doctor.sh` | health check (binaries, endpoint, DB integrity, graph) |
-| `backup-memory.sh`, `maintain-memory.sh` | manual SQLite backup / maintenance |
+| `backup-memory.sh`, `maintain-memory.sh` | manual SQLite backup / maintenance (the binary also does this weekly) |
 | `install.sh`, `configs/` | setup + per-CLI config templates |
 | `.githooks/pre-push`, `.github/workflows/ci.yml` | build/test/clippy gates |
 

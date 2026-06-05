@@ -1,8 +1,10 @@
 //! Runtime configuration, resolved from environment + argv scope.
 //!
-//! The contract is fixed by the `memory-mcp` launch wrapper: the DB location comes
-//! from `MCP_MEMORY_SQLITE_PATH`, embedding settings from the `MCP_EXTERNAL_EMBEDDING_*`
-//! vars, and the store scope from a single `global | project` argv token.
+//! The binary is self-contained: given just a `global | project` argv token it
+//! resolves the DB path (anchoring project memory to the repo root itself),
+//! embedding settings, and the local llama.cpp server it lazily starts. Every
+//! input has an env override (`MCP_MEMORY_SQLITE_PATH`, `MCP_EXTERNAL_EMBEDDING_*`,
+//! `MEMORY_EMBED_*`) so a launch wrapper can still pin them, but none is required.
 
 use std::path::PathBuf;
 
@@ -14,6 +16,14 @@ pub const SERVER_NAME: &str = "memory";
 /// `MCP_EXTERNAL_EMBEDDING_DIM` to use a different model; an existing DB keeps the
 /// width it was created with (auto-detected on open).
 pub const DEFAULT_EMBEDDING_DIM: usize = 2560;
+
+/// Default llama.cpp model repo (the `-hf` arg) the binary starts when the
+/// embedding server isn't already up. Override with `MEMORY_EMBED_REPO`.
+pub const DEFAULT_EMBED_REPO: &str = "Qwen/Qwen3-Embedding-4B-GGUF:Q8_0";
+
+/// Default local embedding-server port; matches the llama.cpp server the binary
+/// starts. Override with `MEMORY_EMBED_PORT` (also parsed from the embedding URL).
+pub const DEFAULT_EMBED_PORT: u16 = 11434;
 
 /// Upper bound sqlite-vec enforces on the `k` of a KNN query.
 pub const MAX_KNN_K: usize = 4096;
@@ -50,9 +60,25 @@ pub struct EmbedConfig {
     pub model: String,
     /// `MCP_EXTERNAL_EMBEDDING_API_KEY`, optional Bearer token.
     pub api_key: Option<String>,
-    /// Absolute path to `llama-embed.sh`, run to start the embedding server on demand
-    /// if it isn't already up. Resolved from `MEMORY_EMBED_ENSURE` or next to the binary.
+    /// Optional power-user override: a script run as `<script> ensure` to bring the
+    /// embedding server up (it owns its own readiness wait). Resolved from
+    /// `MEMORY_EMBED_ENSURE` or a bundled `llama-embed.sh` next to the binary. When
+    /// unset, the binary starts `llama-server` itself (see `llama_server`).
     pub ensure_script: Option<PathBuf>,
+    /// Path to the `llama-server` binary used for the built-in lazy start when no
+    /// `ensure_script` is set. Resolved from `LLAMA_SERVER`, then `PATH`, then the
+    /// Homebrew default. `None` means we can't self-start — we just wait for an
+    /// externally-managed server to answer.
+    pub llama_server: Option<PathBuf>,
+    /// llama.cpp model repo (`-hf`) for the built-in start. `MEMORY_EMBED_REPO`,
+    /// default [`DEFAULT_EMBED_REPO`].
+    pub embed_repo: String,
+    /// Port the local embedding server listens on (built-in start + `/health`
+    /// polling). `MEMORY_EMBED_PORT`, else parsed from `url`, else [`DEFAULT_EMBED_PORT`].
+    pub embed_port: u16,
+    /// How long to poll `/health` after a built-in start before giving up and
+    /// retrying the request anyway. `MEMORY_EMBED_READY_TIMEOUT`, default 40s.
+    pub ready_timeout_secs: u64,
     /// Per-request timeout; kept >= ~40s so the first call can absorb a cold model load.
     pub timeout_secs: u64,
     /// Number of inputs sent per embedding request.
@@ -145,6 +171,21 @@ impl Config {
             .filter(|d| *d > 0)
             .unwrap_or(DEFAULT_EMBEDDING_DIM);
 
+        // Built-in lazy-start settings (used only when `ensure_script` is unset).
+        let embed_repo =
+            std::env::var("MEMORY_EMBED_REPO").unwrap_or_else(|_| DEFAULT_EMBED_REPO.to_string());
+        let embed_port = std::env::var("MEMORY_EMBED_PORT")
+            .ok()
+            .and_then(|s| s.parse::<u16>().ok())
+            .or_else(|| parse_port_from_url(&url))
+            .unwrap_or(DEFAULT_EMBED_PORT);
+        let ready_timeout_secs = std::env::var("MEMORY_EMBED_READY_TIMEOUT")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|t| *t > 0)
+            .unwrap_or(40);
+        let llama_server = find_llama_server();
+
         Ok(Config {
             scope,
             db_path,
@@ -153,6 +194,10 @@ impl Config {
                 model,
                 api_key,
                 ensure_script,
+                llama_server,
+                embed_repo,
+                embed_port,
+                ready_timeout_secs,
                 timeout_secs,
                 batch_size: 32,
                 embedding_dim,
@@ -206,6 +251,36 @@ impl Config {
     }
 }
 
+/// Locate the `llama-server` binary for the built-in embedding start: explicit
+/// `LLAMA_SERVER`, then the first hit on `PATH`, then the Homebrew default. `None`
+/// when nothing is found (the binary then only waits for an external server).
+fn find_llama_server() -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("LLAMA_SERVER") {
+        let p = PathBuf::from(p);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    if let Some(paths) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&paths) {
+            let cand = dir.join("llama-server");
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
+    }
+    let brew = PathBuf::from("/opt/homebrew/bin/llama-server");
+    brew.is_file().then_some(brew)
+}
+
+/// Pull the port out of an `http://host:port/path` URL, used to keep the built-in
+/// start's `--port` and `/health` probe aligned with `MCP_EXTERNAL_EMBEDDING_URL`.
+/// `None` if the authority has no explicit port.
+fn parse_port_from_url(url: &str) -> Option<u16> {
+    let authority = url.split("://").nth(1)?.split('/').next()?;
+    authority.rsplit(':').next()?.parse::<u16>().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,5 +320,13 @@ mod tests {
         let root = Config::find_project_root(&cwd);
         // Workspace root has .git; Cargo.toml lives in rust-memory/ not at root.
         assert!(root.join(".git").is_dir(), "expected git-toplevel as root; got {root:?}");
+    }
+
+    #[test]
+    fn port_parsed_from_url() {
+        assert_eq!(parse_port_from_url("http://127.0.0.1:11434/v1/embeddings"), Some(11434));
+        assert_eq!(parse_port_from_url("https://embed.local:8080/v1/embeddings"), Some(8080));
+        // No explicit port -> None (caller falls back to the default).
+        assert_eq!(parse_port_from_url("http://embed.local/v1/embeddings"), None);
     }
 }

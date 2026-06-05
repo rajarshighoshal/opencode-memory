@@ -8,8 +8,9 @@
 #   3. Activates the pre-push gate (build/test/clippy + shell syntax).
 #   4. Caches the embedding model (llama.cpp auto-downloads the GGUF).
 #   5. Creates the global memory directory.
-#   6. Installs the llama-embed watchdog (macOS launchd; manual elsewhere).
-#   7. Prints the per-CLI config snippets to paste into each tool.
+#   6. Installs the OPTIONAL llama-embed watchdog (stop-when-idle; the binary
+#      already lazy-starts the server itself).
+#   7. Prints the per-CLI config snippets (pointing at the self-contained binary).
 #
 # Safe to re-run — each step is idempotent.
 set -euo pipefail
@@ -21,11 +22,13 @@ EMBEDDING_MODEL="${EMBEDDING_MODEL:-qwen3-embedding-4b}"
 EMBEDDING_URL="${EMBEDDING_URL:-http://localhost:11434/v1/embeddings}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-MEMORY_MCP="$SCRIPT_DIR/memory-mcp"
 RUST_BIN="$SCRIPT_DIR/rust-memory/target/release/opencode-memory"
+# MCP clients point straight at the self-contained binary (the memory-mcp wrapper
+# is now only a thin compat shim for older configs).
+MEMORY_BIN="$RUST_BIN"
 
 echo "==> opencode-memory install"
-echo "    MEMORY_MCP = $MEMORY_MCP"
+echo "    MEMORY_BIN = $MEMORY_BIN"
 echo "    GLOBAL_DB  = $GLOBAL_DB"
 echo "    EMBEDDING  = $EMBEDDING_MODEL @ $EMBEDDING_URL"
 echo
@@ -69,7 +72,7 @@ fi
 # 4. Pre-warm the embedding model (llama.cpp auto-downloads the GGUF)
 # ---------------------------------------------------------------------------
 echo "==> Pre-warming embedding model ($EMBEDDING_MODEL via llama.cpp)"
-chmod +x "$SCRIPT_DIR/llama-embed.sh" "$MEMORY_MCP" \
+chmod +x "$SCRIPT_DIR/llama-embed.sh" "$SCRIPT_DIR/memory-mcp" \
          "$SCRIPT_DIR/llama-embed-watchdog.sh" "$SCRIPT_DIR/doctor.sh" \
          "$SCRIPT_DIR/backup-memory.sh" "$SCRIPT_DIR/maintain-memory.sh"
 "$SCRIPT_DIR/llama-embed.sh" ensure && "$SCRIPT_DIR/llama-embed.sh" stop
@@ -82,9 +85,10 @@ mkdir -p "$GLOBAL_DIR"
 echo "==> Created $GLOBAL_DIR"
 
 # ---------------------------------------------------------------------------
-# 6. Watchdog — starts the embedding server only while an agent CLI is running,
-#    stops it when idle. macOS uses launchd; elsewhere run llama-embed.sh yourself
-#    (or wire llama-embed-watchdog.sh into your own supervisor / systemd unit).
+# 6. Watchdog (OPTIONAL) — the binary already lazy-starts the embedding server on
+#    demand; the watchdog only adds stop-when-idle so the model isn't resident
+#    between sessions. macOS uses launchd; elsewhere wire llama-embed-watchdog.sh
+#    into your own supervisor / systemd unit (or just let the binary start it).
 # ---------------------------------------------------------------------------
 WATCHDOG_SCRIPT="$SCRIPT_DIR/llama-embed-watchdog.sh"
 if [ "$(uname)" = "Darwin" ]; then
@@ -127,7 +131,7 @@ echo
 echo "──────────────────────────────────────────────────────────────────"
 echo "OPENCODE — merge into the 'mcp' block of ~/.config/opencode/opencode.jsonc"
 echo "──────────────────────────────────────────────────────────────────"
-sed -e "s|{{MEMORY_MCP}}|$MEMORY_MCP|g" \
+sed -e "s|{{MEMORY_BIN}}|$MEMORY_BIN|g" \
     -e "s|{{GLOBAL_DIR}}|$GLOBAL_DIR|g" \
     -e "s|{{GLOBAL_DB}}|$GLOBAL_DB|g" \
     "$SCRIPT_DIR/configs/opencode-snippet.jsonc"
@@ -143,22 +147,21 @@ claude mcp add \\
   -e MCP_EXTERNAL_EMBEDDING_URL=$EMBEDDING_URL \\
   -e MCP_EXTERNAL_EMBEDDING_MODEL=$EMBEDDING_MODEL \\
   -s user memory-global \\
-  -- $MEMORY_MCP global
+  -- $MEMORY_BIN global
 
+# project scope auto-anchors to the repo root, so no path env is needed:
 claude mcp add \\
-  -e MCP_MEMORY_BASE_DIR=./.opencode-memory \\
-  -e MCP_MEMORY_SQLITE_PATH=./.opencode-memory/project.db \\
   -e MCP_EXTERNAL_EMBEDDING_URL=$EMBEDDING_URL \\
   -e MCP_EXTERNAL_EMBEDDING_MODEL=$EMBEDDING_MODEL \\
   -s user memory-project \\
-  -- $MEMORY_MCP project
+  -- $MEMORY_BIN project
 EOF
 
 echo
 echo "──────────────────────────────────────────────────────────────────"
 echo "CODEX — merge into ~/.codex/config.toml"
 echo "──────────────────────────────────────────────────────────────────"
-sed -e "s|{{MEMORY_MCP}}|$MEMORY_MCP|g" \
+sed -e "s|{{MEMORY_BIN}}|$MEMORY_BIN|g" \
     -e "s|{{GLOBAL_DIR}}|$GLOBAL_DIR|g" \
     -e "s|{{GLOBAL_DB}}|$GLOBAL_DB|g" \
     "$SCRIPT_DIR/configs/codex-config-snippet.toml"
