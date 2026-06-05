@@ -1,6 +1,6 @@
 [package]
 name = "opencode-memory"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 # MSRV: kept at the toolchain GitHub runners ship so the release build (which
 # verifies it) and `cargo install` work without a bleeding-edge rustc.
