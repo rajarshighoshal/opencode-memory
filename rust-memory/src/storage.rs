@@ -58,7 +58,10 @@ fn now_epoch() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0)
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "system clock is before UNIX_EPOCH; recording timestamp as 0.0");
+            0.0
+        })
 }
 
 /// Recency half-life in days for the optional search reweight; 0 (default) = off.
@@ -256,14 +259,9 @@ pub struct DeleteOutcome {
 /// DB statistics for `memory_health` (counts, sizes, embedding info).
 pub struct DbStats {
     pub total_memories: usize,
-    // Computed for completeness but intentionally NOT surfaced in the
-    // health output.
-    #[allow(dead_code)]
-    pub unique_tags: usize,
-    #[allow(dead_code)]
-    pub memories_this_week: usize,
     pub database_size_bytes: u64,
     pub embedding_model: String,
+    // Resolved for completeness but intentionally NOT surfaced in the health output.
     #[allow(dead_code)]
     pub embedding_dimension: usize,
 }
@@ -455,6 +453,9 @@ impl Storage {
             let query_blob = vec_to_blob(embedding);
             // Brute-force scalar cosine distance over recent live rows (NOT the
             // vec0 KNN MATCH) — the candidate set is bounded by the time window.
+            // This is an O(live rows within the window) 2560-dim scan per store, so
+            // a bulk import into a wide window pays it on every row; pass a
+            // conversation_id (or memory_type="session") to skip this path entirely.
             let dup: Option<(String, f64)> = conn
                 .query_row(
                     "SELECT m.content_hash,
@@ -590,9 +591,10 @@ impl Storage {
             " AND (m.superseded_by IS NULL OR m.superseded_by = '')"
         };
 
-        // Tag filter: ANY-match via LIKE on the comma-wrapped tags column. Only
-        // ANY-match is expressible at the SQL level here; ALL-match is applied as a
-        // post-filter on the returned rows.
+        // Tag filter via LIKE on the comma-wrapped tags column. `any` joins the
+        // per-tag clauses with OR, `all` with AND — pushed into SQL (like list()/
+        // delete()) so the LIMIT operates on the correctly-filtered set, with no
+        // post-truncation narrowing.
         let mut tag_conditions = String::new();
         if !q.tags.is_empty() {
             let clauses: Vec<String> = q
@@ -606,7 +608,8 @@ impl Storage {
                     "(',' || REPLACE(m.tags, ' ', '') || ',') LIKE ? ESCAPE '\\'".to_string()
                 })
                 .collect();
-            tag_conditions = format!(" AND ({})", clauses.join(" OR "));
+            let joiner = if q.tag_match == TagMatch::All { " AND " } else { " OR " };
+            tag_conditions = format!(" AND ({})", clauses.join(joiner));
         }
 
         // Time filters at SQL level (created_at >= / <=).
@@ -645,6 +648,73 @@ impl Storage {
         let rows = stmt.query_map(params_from_iter(params.iter()), |row| {
             Ok(row_to_hit(row))
         })?;
+        let mut hits = Vec::new();
+        for r in rows {
+            hits.push(r??);
+        }
+        Ok(hits)
+    }
+
+    /// No-embedding filtered browse: used when a semantic-family search carries
+    /// tag/time filters but no query string (so there's nothing to embed). Applies
+    /// the same superseded + tag (ANY/ALL) + time clauses as [`Self::search_semantic`]
+    /// minus the KNN join, ordered by `created_at` DESC. distance is fixed at 0.0
+    /// (no similarity signal -> relevance 1.0 for every hit).
+    pub fn search_filtered(&self, q: &SearchQuery) -> Result<Vec<SearchHit>> {
+        let conn = self.conn.lock().unwrap();
+        let mut params: Vec<rusqlite::types::Value> = Vec::new();
+
+        let superseded_filter = if q.include_superseded {
+            ""
+        } else {
+            " AND (m.superseded_by IS NULL OR m.superseded_by = '')"
+        };
+
+        let mut tag_conditions = String::new();
+        if !q.tags.is_empty() {
+            let clauses: Vec<String> = q
+                .tags
+                .iter()
+                .map(|tag| {
+                    params.push(rusqlite::types::Value::Text(format!(
+                        "%,{},%",
+                        escape_like(tag.trim())
+                    )));
+                    "(',' || REPLACE(m.tags, ' ', '') || ',') LIKE ? ESCAPE '\\'".to_string()
+                })
+                .collect();
+            let joiner = if q.tag_match == TagMatch::All { " AND " } else { " OR " };
+            tag_conditions = format!(" AND ({})", clauses.join(joiner));
+        }
+
+        let mut time_conditions = String::new();
+        if let Some(after) = &q.after {
+            if let Some(ts) = parse_iso_date_to_epoch(after) {
+                time_conditions.push_str(" AND m.created_at >= ?");
+                params.push(rusqlite::types::Value::Real(ts));
+            }
+        }
+        if let Some(before) = &q.before {
+            if let Some(ts) = parse_iso_date_to_epoch(before) {
+                time_conditions.push_str(" AND m.created_at <= ?");
+                params.push(rusqlite::types::Value::Real(ts));
+            }
+        }
+
+        params.push(rusqlite::types::Value::Integer(q.limit as i64));
+
+        let sql = format!(
+            "SELECT m.content_hash, m.content, m.tags, m.memory_type, m.metadata,
+                    m.created_at, m.updated_at, m.created_at_iso, m.updated_at_iso,
+                    0.0 AS distance
+             FROM memories m
+             WHERE m.deleted_at IS NULL{superseded_filter}{tag_conditions}{time_conditions}
+             ORDER BY m.created_at DESC
+             LIMIT ?"
+        );
+
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(params.iter()), |row| Ok(row_to_hit(row)))?;
         let mut hits = Vec::new();
         for r in rows {
             hits.push(r??);
@@ -768,7 +838,7 @@ impl Storage {
     /// with relevance_score normalized to [0,1] (best = 1.0). The vector arm's
     /// `distance` is preserved on each hit for output.
     pub fn search_hybrid(&self, q: &SearchQuery, query_embedding: &[f32]) -> Result<Vec<SearchHit>> {
-        let pool = q.limit.max(1) * 3;
+        let pool = q.limit.max(1).saturating_mul(3);
         let mut sem_q = q.clone();
         sem_q.limit = pool;
         let sem = self.search_semantic(&sem_q, query_embedding)?;
@@ -838,7 +908,7 @@ impl Storage {
     /// optional tag/type filters, ORDER BY created_at DESC, LIMIT/OFFSET.
     pub fn list(&self, q: &ListQuery) -> Result<ListPage> {
         let conn = self.conn.lock().unwrap();
-        let offset = (q.page.saturating_sub(1)) * q.page_size;
+        let offset = q.page.saturating_sub(1).saturating_mul(q.page_size);
 
         // Build shared WHERE clause + params (deleted_at IS NULL always).
         // NOTE: list does NOT filter superseded rows — only soft-deleted.
@@ -899,7 +969,7 @@ impl Storage {
         } else {
             0
         };
-        let has_more = offset + q.page_size < total;
+        let has_more = offset.saturating_add(q.page_size) < total;
 
         Ok(ListPage {
             memories,
@@ -1098,9 +1168,42 @@ impl Storage {
         })
     }
 
+    /// Read a live memory's `(tags, memory_type)` for the versioned-update
+    /// carry-over (so a content-only new version keeps the parent's tags/type).
+    /// Returns `(vec![], None)` if the hash isn't a live row.
+    pub fn get_tags_type(&self, content_hash: &str) -> Result<(Vec<String>, Option<String>)> {
+        let conn = self.conn.lock().unwrap();
+        let row = conn
+            .query_row(
+                "SELECT tags, memory_type FROM memories WHERE content_hash = ?1 AND deleted_at IS NULL",
+                [content_hash],
+                |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?)),
+            )
+            .optional()?;
+        Ok(match row {
+            Some((tags, mt)) => (tags.as_deref().map(tags_from_csv).unwrap_or_default(), mt),
+            None => (Vec::new(), None),
+        })
+    }
+
+    /// Mark a memory superseded by another (sets the `superseded_by` COLUMN that
+    /// every search path filters on). Called by the tool-layer versioned update
+    /// after it inserts the new row. No-op if `old_hash` isn't a live row.
+    pub fn mark_superseded(&self, old_hash: &str, new_hash: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = now_epoch();
+        conn.execute(
+            "UPDATE memories SET superseded_by = ?1, updated_at = ?2, updated_at_iso = ?3
+             WHERE content_hash = ?4 AND deleted_at IS NULL",
+            rusqlite::params![new_hash, now, epoch_to_iso(now), old_hash],
+        )?;
+        Ok(())
+    }
+
     /// Update metadata/tags/type for a memory (`memory_update`). Non-versioned
-    /// path updates in place + bumps updated_at/_iso. Versioned path (updates.content
-    /// set) supersedes the old row (sets superseded_by) and inserts a new one.
+    /// path updates in place + bumps updated_at/_iso. The versioned path (when
+    /// `updates.content` is set) is handled by the tool layer, which inserts the new
+    /// row and then calls [`Self::mark_superseded`] on the old one.
     /// Returns a human-readable message (the handler returns it verbatim).
     pub fn update(&self, content_hash: &str, updates: &serde_json::Value, _versioned: bool) -> Result<String> {
         // Versioned supersede is handled at the tool layer (it needs an embedding
@@ -1242,31 +1345,12 @@ impl Storage {
     /// DB statistics for `memory_health.statistics`.
     pub fn stats(&self, embedding_model: &str) -> Result<DbStats> {
         let conn = self.conn.lock().unwrap();
-        let week_ago = now_epoch() - 7.0 * 24.0 * 60.0 * 60.0;
 
         let total: i64 = conn.query_row(
             "SELECT COUNT(*) FROM memories WHERE deleted_at IS NULL",
             [],
             |r| r.get(0),
         )?;
-        let this_week: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM memories WHERE created_at >= ?1 AND deleted_at IS NULL",
-            [week_ago],
-            |r| r.get(0),
-        )?;
-
-        // unique individual tags (not tag-sets) across live rows.
-        let mut stmt = conn.prepare(
-            "SELECT tags FROM memories WHERE tags IS NOT NULL AND tags != '' AND deleted_at IS NULL",
-        )?;
-        let mut tag_set = std::collections::HashSet::new();
-        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-        for r in rows {
-            for t in tags_from_csv(&r?) {
-                tag_set.insert(t);
-            }
-        }
-        drop(stmt);
 
         // DB file size — best-effort.
         let db_path: String = conn.query_row("PRAGMA database_list", [], |r| r.get(2)).unwrap_or_default();
@@ -1274,8 +1358,6 @@ impl Storage {
 
         Ok(DbStats {
             total_memories: total as usize,
-            unique_tags: tag_set.len(),
-            memories_this_week: this_week as usize,
             database_size_bytes,
             embedding_model: embedding_model.to_string(),
             embedding_dimension: self.embedding_dim,
@@ -1362,7 +1444,7 @@ WITH RECURSIVE paths(hash, distance, path) AS (
     WHERE p.distance < ?3
       AND instr(p.path, ',' || (CASE WHEN p.hash = mg.source_hash THEN mg.target_hash ELSE mg.source_hash END) || ',') = 0
 )
-SELECT path FROM paths WHERE hash = ?4 ORDER BY distance LIMIT 1
+SELECT path FROM paths WHERE hash = ?4 ORDER BY distance, path LIMIT 1
 ";
         let seed = format!(",{from},");
         let path_str: Option<String> = conn
@@ -1836,6 +1918,71 @@ mod tests {
         let hits = s.search(&q, Some(&seeded_embed(1))).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].memory.content, "a");
+    }
+
+    #[test]
+    fn search_semantic_tag_filter_all() {
+        // ALL-match is enforced in SQL: only rows carrying every tag come back.
+        let s = open_test_storage();
+        store_mem(&s, "ab", 1, &["x", "y"], None);
+        store_mem(&s, "a_only", 2, &["x"], None);
+        store_mem(&s, "ab2", 3, &["x", "y"], None);
+        let mut q = sq("ab", SearchMode::Semantic, 5);
+        q.tags = vec!["x".into(), "y".into()];
+        q.tag_match = TagMatch::All;
+        let hits = s.search(&q, Some(&seeded_embed(1))).unwrap();
+        let mut got: Vec<_> = hits.iter().map(|h| h.memory.content.clone()).collect();
+        got.sort();
+        assert_eq!(got, vec!["ab".to_string(), "ab2".to_string()]);
+    }
+
+    #[test]
+    fn mark_superseded_hidden_unless_included() {
+        let s = open_test_storage();
+        let old = store_mem(&s, "old version", 1, &["t"], None);
+        s.mark_superseded(&old, "newhash123").unwrap();
+        // Default search hides the superseded row...
+        let mut q = sq("old version", SearchMode::Semantic, 5);
+        let hits = s.search(&q, Some(&seeded_embed(1))).unwrap();
+        assert!(
+            hits.iter().all(|h| h.memory.content_hash != old),
+            "superseded row must be hidden by default"
+        );
+        // ...but include_superseded surfaces it again.
+        q.include_superseded = true;
+        let hits = s.search(&q, Some(&seeded_embed(1))).unwrap();
+        assert!(
+            hits.iter().any(|h| h.memory.content_hash == old),
+            "include_superseded must surface the superseded row"
+        );
+    }
+
+    #[test]
+    fn search_filtered_browse_by_tags() {
+        // No query string + a tag filter -> filtered browse (no embedding needed).
+        let s = open_test_storage();
+        store_mem(&s, "m1", 1, &["proj"], None);
+        store_mem(&s, "m2", 2, &["other"], None);
+        store_mem(&s, "m3", 3, &["proj"], None);
+        let mut q = sq("", SearchMode::Semantic, 10);
+        q.tags = vec!["proj".into()];
+        let hits = s.search_filtered(&q).unwrap();
+        let mut got: Vec<_> = hits.iter().map(|h| h.memory.content.clone()).collect();
+        got.sort();
+        assert_eq!(got, vec!["m1".to_string(), "m3".to_string()]);
+    }
+
+    #[test]
+    fn get_tags_type_reads_parent() {
+        let s = open_test_storage();
+        let h = store_mem(&s, "parent", 1, &["a", "b"], Some("decision"));
+        let (mut tags, mt) = s.get_tags_type(&h).unwrap();
+        tags.sort();
+        assert_eq!(tags, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(mt.as_deref(), Some("decision"));
+        // Unknown hash -> empty carry-over.
+        let (t2, m2) = s.get_tags_type("nope").unwrap();
+        assert!(t2.is_empty() && m2.is_none());
     }
 
     #[test]

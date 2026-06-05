@@ -46,27 +46,21 @@ fn quantile_sorted(sorted: &[f64], q: f64) -> f64 {
     sorted[lo] + frac * (sorted[hi] - sorted[lo])
 }
 
-/// Pick the similarity window [lo, hi] from the data: keep the graph sparse by
-/// using the 0.88 quantile of pairwise mapped similarities as the lower bound
-/// (clamped to [0.50, 0.90]); hi = 0.98.
-fn pick_window(normalized: &[Vec<f32>]) -> (f64, f64) {
-    let n = normalized.len();
-    if n < 2 {
+/// Above this memory count, log a heads-up that the weekly O(n^2) consolidation
+/// pass is large (it still runs — detached, WAL, lock-guarded — just slowly).
+const CONSOLIDATE_WARN_N: usize = 5000;
+
+/// Pick the similarity window [lo, hi] from already-computed pairwise similarities:
+/// keep the graph sparse via the 0.88 quantile lower bound (clamped to [0.50, 0.90])
+/// once there are >= 20 pairs, else 0.50; hi = 0.98. Takes the sims so the caller's
+/// single pairwise pass is reused (no recomputation of the dot products).
+fn pick_window_from_sims(sims: impl Iterator<Item = f64>) -> (f64, f64) {
+    let mut sims: Vec<f64> = sims.collect();
+    if sims.len() < 20 {
         return (0.50, 0.98);
     }
-    let mut sims: Vec<f64> = Vec::with_capacity(n * (n - 1) / 2);
-    for i in 0..n {
-        for j in (i + 1)..n {
-            sims.push(mapped_cosine(&normalized[i], &normalized[j]));
-        }
-    }
     sims.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let lo = if sims.len() >= 20 {
-        quantile_sorted(&sims, 0.88).clamp(0.50, 0.90)
-    } else {
-        0.50
-    };
-    (lo, 0.98)
+    (quantile_sorted(&sims, 0.88).clamp(0.50, 0.90), 0.98)
 }
 
 /// Cosine of two already-L2-normalized vectors, mapped to [0, 1] via (cos+1)/2.
@@ -149,7 +143,23 @@ pub fn run(db_path: &str) -> Result<Report> {
     let edges_before: usize =
         conn.query_row("SELECT COUNT(*) FROM memory_graph", [], |r| r.get::<_, i64>(0))? as usize;
 
-    let (lo, hi) = pick_window(&norms);
+    // Score every pair ONCE — the 2560-dim dot products dominate runtime — and
+    // reuse the buffer for both the window quantile and edge emission (previously
+    // the matrix was computed twice). Surface the work magnitude before it runs.
+    let pair_count = n.saturating_mul(n.saturating_sub(1)) / 2;
+    if n >= 2 {
+        tracing::info!(memories = n, pairs = pair_count, "consolidation: scoring pairwise cosine similarities");
+        if n > CONSOLIDATE_WARN_N {
+            tracing::warn!(memories = n, pairs = pair_count, "large memory count; weekly consolidation is O(n^2) and may take a while");
+        }
+    }
+    let mut pairs: Vec<(usize, usize, f64)> = Vec::with_capacity(pair_count);
+    for i in 0..n {
+        for j in (i + 1)..n {
+            pairs.push((i, j, mapped_cosine(&norms[i], &norms[j])));
+        }
+    }
+    let (lo, hi) = pick_window_from_sims(pairs.iter().map(|&(_, _, s)| s));
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -164,21 +174,18 @@ pub fn run(db_path: &str) -> Result<Report> {
                  (source_hash, target_hash, similarity, connection_types, metadata, created_at, relationship_type) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'related')",
             )?;
-            for i in 0..n {
-                for j in (i + 1)..n {
-                    let sim = mapped_cosine(&norms[i], &norms[j]);
-                    if sim < lo || sim > hi {
-                        continue;
-                    }
-                    let ct = connection_types(&tag_lists[i], &tag_lists[j]);
-                    let metadata = format!(
-                        "{{\"discovery_method\": \"semantic_cosine\", \"confidence\": {:.6}}}",
-                        sim
-                    );
-                    // Write both directions: the graph stores symmetric edges.
-                    ins.execute(params![hashes[i], hashes[j], sim, ct, metadata, now])?;
-                    ins.execute(params![hashes[j], hashes[i], sim, ct, metadata, now])?;
+            for &(i, j, sim) in &pairs {
+                if sim < lo || sim > hi {
+                    continue;
                 }
+                let ct = connection_types(&tag_lists[i], &tag_lists[j]);
+                let metadata = format!(
+                    "{{\"discovery_method\": \"semantic_cosine\", \"confidence\": {:.6}}}",
+                    sim
+                );
+                // Write both directions: the graph stores symmetric edges.
+                ins.execute(params![hashes[i], hashes[j], sim, ct, metadata, now])?;
+                ins.execute(params![hashes[j], hashes[i], sim, ct, metadata, now])?;
             }
         }
         tx.commit()?;
@@ -281,16 +288,24 @@ mod tests {
 
     #[test]
     fn test_pick_window_empty() {
-        let (lo, hi) = pick_window(&[]);
+        let (lo, hi) = pick_window_from_sims(std::iter::empty());
         assert_eq!(lo, 0.50);
         assert_eq!(hi, 0.98);
     }
 
     #[test]
-    fn test_pick_window_single() {
-        let v = vec![vec![1.0f32, 0.0, 0.0]];
-        let (lo, hi) = pick_window(&v);
+    fn test_pick_window_few_pairs() {
+        // Fewer than 20 pairs -> default window (no quantile narrowing).
+        let (lo, hi) = pick_window_from_sims([0.7, 0.8, 0.9].into_iter());
         assert_eq!(lo, 0.50);
+        assert_eq!(hi, 0.98);
+    }
+
+    #[test]
+    fn test_pick_window_quantile_clamped() {
+        // >=20 pairs: lo = 0.88-quantile clamped into [0.50, 0.90].
+        let (lo, hi) = pick_window_from_sims(vec![0.99f64; 25].into_iter());
+        assert_eq!(lo, 0.90);
         assert_eq!(hi, 0.98);
     }
 

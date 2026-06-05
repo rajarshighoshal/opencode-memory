@@ -54,13 +54,21 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// True if `stamp` is missing, unparseable, or older than `interval` seconds.
+/// True if `stamp` is genuinely missing or older than `interval` seconds. A stamp
+/// that exists but is corrupt (truncated/garbled write) is treated as NOT due and
+/// re-stamped, so a bad write doesn't re-run the (expensive) task on every startup.
 fn is_due(stamp: &Path, interval: u64) -> bool {
-    let last = std::fs::read_to_string(stamp)
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .unwrap_or(0);
-    now_secs().saturating_sub(last) >= interval
+    match std::fs::read_to_string(stamp) {
+        Ok(s) => match s.trim().parse::<u64>() {
+            Ok(last) => now_secs().saturating_sub(last) >= interval,
+            Err(_) => {
+                tracing::warn!(stamp = %stamp.display(), contents = %s.trim(), "maintenance stamp is unparseable; re-stamping and skipping this run");
+                stamp_now(stamp);
+                false
+            }
+        },
+        Err(_) => true, // absent -> due
+    }
 }
 
 /// Write the current epoch to `stamp` (best-effort).
@@ -68,17 +76,51 @@ fn stamp_now(stamp: &Path) {
     let _ = std::fs::write(stamp, now_secs().to_string());
 }
 
+/// A lock dir older than this is presumed stale — left by a process that died
+/// before Drop ran. Comfortably longer than any real maintenance run.
+const STALE_LOCK_SECS: u64 = 2 * WEEK_SECS;
+
 /// RAII lock backed by an atomic `create_dir`: present = held. Released on drop.
-/// `try_acquire` returns `None` when another process already holds it.
+/// `try_acquire` returns `None` when another live process already holds it, but
+/// self-heals a stale lock (older than [`STALE_LOCK_SECS`]) so a crash can't block
+/// maintenance forever.
 struct DirLock(PathBuf);
 
 impl DirLock {
     fn try_acquire(path: PathBuf) -> Option<Self> {
         match std::fs::create_dir(&path) {
             Ok(()) => Some(DirLock(path)),
-            Err(_) => None,
+            Err(_) => {
+                // Held. If the existing lock is stale, a previous run likely died
+                // before Drop — recover it once. Otherwise it's a live concurrent run.
+                match lock_age_secs(&path) {
+                    Ok(age) if age >= STALE_LOCK_SECS => {
+                        let _ = std::fs::remove_dir(&path);
+                        match std::fs::create_dir(&path) {
+                            Ok(()) => {
+                                tracing::warn!(lock = %path.display(), age_secs = age, "recovered a stale maintenance lock");
+                                Some(DirLock(path))
+                            }
+                            Err(_) => None,
+                        }
+                    }
+                    _ => {
+                        tracing::debug!(lock = %path.display(), "maintenance lock held by another run; skipping");
+                        None
+                    }
+                }
+            }
         }
     }
+}
+
+/// Seconds since the lock dir was last modified (its creation time, in practice).
+fn lock_age_secs(path: &Path) -> std::io::Result<u64> {
+    let mtime = std::fs::metadata(path)?.modified()?;
+    Ok(SystemTime::now()
+        .duration_since(mtime)
+        .map(|d| d.as_secs())
+        .unwrap_or(0))
 }
 
 impl Drop for DirLock {

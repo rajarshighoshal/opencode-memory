@@ -177,6 +177,7 @@ impl Config {
         let embed_port = std::env::var("MEMORY_EMBED_PORT")
             .ok()
             .and_then(|s| s.parse::<u16>().ok())
+            .filter(|p| *p > 0)
             .or_else(|| parse_port_from_url(&url))
             .unwrap_or(DEFAULT_EMBED_PORT);
         let ready_timeout_secs = std::env::var("MEMORY_EMBED_READY_TIMEOUT")

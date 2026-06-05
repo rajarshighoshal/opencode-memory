@@ -69,7 +69,7 @@ check_db() {
   dangling="$(sqlite3 "$db" 'SELECT COUNT(*) FROM memory_graph WHERE source_hash NOT IN (SELECT content_hash FROM memories WHERE deleted_at IS NULL) OR target_hash NOT IN (SELECT content_hash FROM memories WHERE deleted_at IS NULL)' 2>/dev/null || echo 0)"
   pass "$label memories=$mem  graph_edges=$edges"
   if [[ "$dangling" =~ ^[0-9]+$ && "$dangling" -gt 0 ]]; then
-    warn "$label has $dangling dangling graph edge(s) — run: $RUST_BIN consolidate $db"
+    warn "$label has $dangling dangling graph edge(s) — run: \"$RUST_BIN\" consolidate \"$db\""
   else
     pass "$label no dangling graph edges"
   fi

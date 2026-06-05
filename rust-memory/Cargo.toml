@@ -1,9 +1,9 @@
 [package]
 name = "opencode-memory"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
-# MSRV: kept at the toolchain GitHub runners ship so the release build (which
-# verifies it) and `cargo install` work without a bleeding-edge rustc.
+# MSRV: kept at the toolchain GitHub runners ship so `cargo install` works without a
+# bleeding-edge rustc. The CI `msrv` job pins 1.95.0 and `cargo check`s to keep it honest.
 rust-version = "1.95"
 description = "Persistent semantic memory for AI agents — a single self-contained stdio MCP server over SQLite + sqlite-vec with local llama.cpp embeddings."
 license = "MIT"

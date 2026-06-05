@@ -228,12 +228,22 @@ impl EmbedClient {
             return Ok(());
         }
 
+        // Only a LOCAL self-start can satisfy a loopback endpoint; for a remote URL,
+        // spawning a local llama-server would be pointless, so skip it and wait.
+        let local = self.url_is_loopback();
         match self.cfg.llama_server {
-            Some(ref bin) => {
+            Some(ref bin) if local => {
                 self.spawn_llama_server(bin);
                 self.wait_until_ready().await;
             }
-            None => {
+            _ if !local => {
+                tracing::warn!(
+                    url = %self.cfg.url,
+                    "embedding endpoint is not loopback; not starting a local llama-server — \
+                     start it yourself or set MEMORY_EMBED_ENSURE"
+                );
+            }
+            _ => {
                 tracing::warn!(
                     "embedding server unreachable and no llama-server found (set LLAMA_SERVER, \
                      put it on PATH, or set MEMORY_EMBED_ENSURE); waiting for an external server"
@@ -243,12 +253,12 @@ impl EmbedClient {
         Ok(())
     }
 
-    /// `GET /health` with a short timeout; `true` on a 2xx. Used both to skip a
-    /// redundant start and to poll for readiness after one.
+    /// `GET <cfg.url scheme+host+port>/health` with a short timeout; `true` on a 2xx.
+    /// Probes the SAME endpoint the embeddings POST targets (not a hardcoded
+    /// localhost), so the self-heal logic works for remote/https configs too.
     async fn health_ok(&self) -> bool {
-        let url = format!("http://127.0.0.1:{}/health", self.cfg.embed_port);
         self.http
-            .get(&url)
+            .get(self.health_url())
             .timeout(Duration::from_secs(2))
             .send()
             .await
@@ -256,10 +266,39 @@ impl EmbedClient {
             .unwrap_or(false)
     }
 
-    /// Spawn `llama-server` detached with the throughput-tuned embedding flags
-    /// (mirrors the bundled `llama-embed.sh`). The child outlives this call and is
-    /// not reaped — it's a long-running server, managed externally (or by an
-    /// optional idle watchdog). stdio goes to `/tmp/llama-embed.log` for triage.
+    /// Derive the `/health` URL from `cfg.url` (same scheme + authority).
+    fn health_url(&self) -> String {
+        match self.cfg.url.split_once("://") {
+            Some((scheme, rest)) => {
+                let authority = rest.split('/').next().unwrap_or(rest);
+                format!("{scheme}://{authority}/health")
+            }
+            None => format!("http://127.0.0.1:{}/health", self.cfg.embed_port),
+        }
+    }
+
+    /// True if `cfg.url`'s host is loopback — the only case where starting a LOCAL
+    /// llama-server can serve the configured endpoint.
+    fn url_is_loopback(&self) -> bool {
+        let host = self
+            .cfg
+            .url
+            .split_once("://")
+            .map(|(_, rest)| rest.split('/').next().unwrap_or(rest))
+            .map(|authority| match authority.rsplit_once(':') {
+                // strip a trailing :port (all-digit); leave bracketed IPv6 intact
+                Some((h, p)) if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => h,
+                _ => authority,
+            })
+            .unwrap_or("");
+        matches!(host, "127.0.0.1" | "localhost" | "::1" | "[::1]")
+    }
+
+    /// Spawn `llama-server` with the throughput-tuned embedding flags (mirrors the
+    /// bundled `llama-embed.sh`). A detached reaper thread `wait()`s on the child so
+    /// it never becomes a zombie if it later exits (crash / idle watchdog) during
+    /// this process's lifetime; if this process exits first the child is reparented
+    /// to init, which reaps it. stdio goes to `/tmp/llama-embed.log` for triage.
     fn spawn_llama_server(&self, bin: &Path) {
         use std::process::{Command, Stdio};
         let port = self.cfg.embed_port.to_string();
@@ -299,10 +338,16 @@ impl EmbedClient {
             .stderr(err)
             .spawn();
         match spawned {
-            Ok(_child) => tracing::info!(
-                bin = %bin.display(), repo = %self.cfg.embed_repo, port = %port,
-                "started embedding server (llama-server)"
-            ),
+            Ok(mut child) => {
+                tracing::info!(
+                    bin = %bin.display(), repo = %self.cfg.embed_repo, port = %port,
+                    "started embedding server (llama-server)"
+                );
+                // Reap on exit so a crashed/idle-stopped server doesn't linger as a zombie.
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+            }
             Err(e) => {
                 tracing::warn!(bin = %bin.display(), error = %e, "failed to spawn llama-server")
             }
@@ -372,4 +417,36 @@ fn reorder_and_validate(items: Vec<EmbedItem>, expected_len: usize, dim: usize) 
             v.ok_or_else(|| EmbedError::BadResponse(format!("missing embedding for index {i}")))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Scope;
+
+    fn client(url: &str) -> EmbedClient {
+        let mut embed = crate::test_util::test_config(Scope::Project).embed;
+        embed.url = url.to_string();
+        EmbedClient::new(embed).expect("build client")
+    }
+
+    #[test]
+    fn loopback_detection() {
+        assert!(client("http://127.0.0.1:11434/v1/embeddings").url_is_loopback());
+        assert!(client("http://localhost:11434/v1/embeddings").url_is_loopback());
+        assert!(!client("http://gpu-box:11434/v1/embeddings").url_is_loopback());
+        assert!(!client("https://api.example.com/v1/embeddings").url_is_loopback());
+    }
+
+    #[test]
+    fn health_url_mirrors_endpoint() {
+        assert_eq!(
+            client("http://127.0.0.1:11434/v1/embeddings").health_url(),
+            "http://127.0.0.1:11434/health"
+        );
+        assert_eq!(
+            client("https://gpu:8443/v1/embeddings").health_url(),
+            "https://gpu:8443/health"
+        );
+    }
 }

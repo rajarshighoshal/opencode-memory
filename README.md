@@ -152,7 +152,7 @@ The binary lazy-starts `llama-server` the first time it needs to embed, so nothi
 | `backup-memory.sh`, `maintain-memory.sh` | manual SQLite backup / maintenance (the binary also does this weekly) |
 | `install.sh`, `configs/` | setup + per-CLI config templates |
 | `.githooks/pre-push`, `.github/workflows/ci.yml` | build/test/clippy gates |
-| `rust-memory/dist-workspace.toml`, `.github/workflows/release.yml` | [cargo-dist](https://opensource.axo.dev/cargo-dist/) release: prebuilt binaries + installer on tag push |
+| `dist-workspace.toml`, `.github/workflows/release.yml` | [cargo-dist](https://opensource.axo.dev/cargo-dist/) release: prebuilt binaries + installer on tag push |
 
 ## Development
 

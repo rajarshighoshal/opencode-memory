@@ -345,12 +345,25 @@ impl MemoryServer {
             include_superseded: args.include_superseded.unwrap_or(false),
         };
 
+        // A semantic-family search with no query string can't embed anything. If
+        // tag/time filters are present, that's a "browse by filter" request — serve
+        // it from a no-embedding filtered query rather than returning nothing.
+        let semantic_family = !matches!(mode, SearchMode::Exact);
+        let has_filters = !sq.tags.is_empty() || sq.after.is_some() || sq.before.is_some();
+        if semantic_family && query.is_empty() {
+            let hits = if has_filters {
+                match self.storage.search_filtered(&sq) {
+                    Ok(h) => h,
+                    Err(e) => return Ok(text_result(format!("Error searching memories: {e}"))),
+                }
+            } else {
+                Vec::new()
+            };
+            return Ok(text_result(format::search_results(&query, &mode_str, &hits)));
+        }
+
         // Semantic / hybrid / ranked need a query embedding; exact does not.
         let embedding = if matches!(mode, SearchMode::Exact) {
-            None
-        } else if query.is_empty() {
-            // No query for a semantic-family search: nothing to embed, so the
-            // search returns empty.
             None
         } else {
             match self.embed.embed_one(&query).await {
@@ -361,25 +374,11 @@ impl MemoryServer {
             }
         };
 
+        // ALL/ANY tag matching is enforced in SQL by storage.search(), so the rows
+        // returned are already correctly filtered and limited.
         let hits = match self.storage.search(&sq, embedding.as_deref()) {
             Ok(h) => h,
             Err(e) => return Ok(text_result(format!("Error searching memories: {e}"))),
-        };
-
-        // For ALL tag_match, post-filter in Rust because the SQL tag filter is
-        // ANY-match only. Compare case-insensitively: sq.tags is already
-        // lowercased by normalize_tags, but older stored tags could be
-        // mixed-case, so lowercase both sides here.
-        let hits = if sq.tag_match == TagMatch::All && !sq.tags.is_empty() {
-            hits.into_iter()
-                .filter(|h| {
-                    let stored: Vec<String> =
-                        h.memory.tags.iter().map(|t| t.to_lowercase()).collect();
-                    sq.tags.iter().all(|t| stored.contains(&t.to_lowercase()))
-                })
-                .collect()
-        } else {
-            hits
         };
 
         Ok(text_result(format::search_results(&query, &mode_str, &hits)))
@@ -543,10 +542,11 @@ impl MemoryServer {
         }
     }
 
-    /// Versioned supersede: embed + store the new content (dedup-skipped), then
-    /// stamp the old row's `metadata.superseded_by = <new_hash>`. The supersede
-    /// marker lives in metadata, NOT in a dedicated column, so superseded rows
-    /// still surface in search unless explicitly filtered out.
+    /// Versioned supersede: embed + store the new content (dedup-skipped), then set
+    /// the old row's `superseded_by` COLUMN to the new hash — the column every
+    /// search path filters on, so the old version stops surfacing under the default
+    /// `include_superseded:false`. Tags/type carry over from the parent unless
+    /// explicitly overridden; an optional `reason` is stamped into metadata.
     async fn versioned_update(
         &self,
         content_hash: &str,
@@ -562,10 +562,16 @@ impl MemoryServer {
             }
         };
 
+        // Carry over the parent's tags/type when not explicitly supplied. A present-
+        // but-empty `tags: []` is Some(vec![]) and correctly means "clear tags".
+        let (parent_tags, parent_type) = self
+            .storage
+            .get_tags_type(content_hash)
+            .unwrap_or_default();
         let store_args = StorageStoreArgs {
             content: new_content.to_string(),
-            tags: new_tags.unwrap_or_default(),
-            memory_type: new_type,
+            tags: new_tags.unwrap_or(parent_tags),
+            memory_type: new_type.or(parent_type),
             metadata: self.provenance_metadata(),
             conversation_id: Some("versioned".to_string()), // skip semantic dedup
         };
@@ -578,26 +584,23 @@ impl MemoryServer {
             Err(e) => return text_result(format!("Failed versioned update: {e}")),
         };
 
-        // Stamp metadata.superseded_by (+ optional evolution_reason) on the old row.
-        let mut meta = serde_json::Map::new();
-        meta.insert(
-            "superseded_by".to_string(),
-            serde_json::Value::String(new_hash.clone()),
-        );
+        // Set the superseded_by COLUMN on the old row (what search filters on).
+        if let Err(e) = self.storage.mark_superseded(content_hash, &new_hash) {
+            return text_result(format!("Failed versioned update: {e}"));
+        }
+        // Optional human-facing evolution reason lives in the old row's metadata.
         if let Some(r) = reason {
-            meta.insert("evolution_reason".to_string(), serde_json::Value::String(r));
+            let updates = serde_json::json!({ "metadata": { "evolution_reason": r } });
+            let _ = self.storage.update(content_hash, &updates, false);
         }
-        let updates = serde_json::json!({ "metadata": serde_json::Value::Object(meta) });
-        match self.storage.update(content_hash, &updates, false) {
-            Ok(_) => text_result(format!(
-                "Versioned update successful. New hash: {new_hash}, parent hash: {content_hash}. Memory versioned successfully"
-            )),
-            Err(e) => text_result(format!("Failed versioned update: {e}")),
-        }
+        text_result(format!(
+            "Versioned update successful. New hash: {new_hash}, parent hash: {content_hash}. Memory versioned successfully"
+        ))
     }
 
     /// DB health. Returns `"Database Health Check Results:\n"` + JSON
-    /// (version, validation, statistics{total_memories, embedding_dimension:2560, ...}).
+    /// (version, validation, statistics{status, backend, total_memories,
+    /// embedding_model, database_size_bytes, database_size_mb}).
     #[tool(description = "Report database health, statistics, and embedding configuration")]
     pub async fn memory_health(&self) -> Result<CallToolResult, McpError> {
         let _t = self.timer();
@@ -719,6 +722,11 @@ impl MemoryServer {
             serde_json::to_string_pretty(v).unwrap_or_else(|_| "{}".to_string())
         };
 
+        // Bound traversal depth so a large max_hops can't pin the single shared
+        // connection on a dense graph (mirrors the limit/page_size clamps). A
+        // ceiling of 8 is well past any useful BFS depth on a sparse association graph.
+        const MAX_GRAPH_HOPS: usize = 8;
+
         match args.action.as_str() {
             "connected" => {
                 let Some(hash) = args.hash.clone() else {
@@ -726,7 +734,7 @@ impl MemoryServer {
                         "Error: hash is required for 'connected' action".to_string(),
                     ));
                 };
-                let max_hops = args.max_hops.unwrap_or(2);
+                let max_hops = args.max_hops.unwrap_or(2).clamp(1, MAX_GRAPH_HOPS);
                 match self.storage.graph_connected(&hash, max_hops) {
                     Ok(connected) => Ok(text_result(dump(&serde_json::json!({
                         "success": true,
@@ -744,7 +752,7 @@ impl MemoryServer {
                         "Error: 'path' requires 'hash' (from) and 'target' (to)".to_string(),
                     ));
                 };
-                let max_hops = args.max_hops.unwrap_or(5);
+                let max_hops = args.max_hops.unwrap_or(5).clamp(1, MAX_GRAPH_HOPS);
                 match self.storage.graph_path(&from, &to, max_hops) {
                     Ok(path) => {
                         let hops = if path.is_empty() {
@@ -765,7 +773,7 @@ impl MemoryServer {
                         "Error: hash is required for 'subgraph' action".to_string(),
                     ));
                 };
-                let max_hops = args.max_hops.unwrap_or(2);
+                let max_hops = args.max_hops.unwrap_or(2).clamp(1, MAX_GRAPH_HOPS);
                 match self.storage.graph_subgraph(&hash, max_hops) {
                     Ok((nodes, edges)) => Ok(text_result(dump(&serde_json::json!({
                         "success": true,

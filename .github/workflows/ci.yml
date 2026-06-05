@@ -44,3 +44,20 @@ jobs:
         run: cargo clippy --release -- -D warnings
       - name: test
         run: cargo test --release
+
+  # Verify the declared MSRV (rust-version in Cargo.toml) actually compiles, so the
+  # crates.io minimum stays honest. `cargo check` (not build/test) keeps it fast and
+  # avoids dev-dependency MSRV noise.
+  msrv:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust-memory
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust-memory
+      - name: cargo check (MSRV 1.95)
+        run: cargo check --release
