@@ -1,5 +1,9 @@
 # opencode-memory
 
+[![crates.io](https://img.shields.io/crates/v/opencode-memory.svg)](https://crates.io/crates/opencode-memory)
+[![release](https://img.shields.io/github/v/release/rajarshighoshal/opencode-memory.svg)](https://github.com/rajarshighoshal/opencode-memory/releases/latest)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Persistent, semantic **memory for AI coding agents** — shared across **opencode**, **Claude Code**, and **Codex CLI** via the Model Context Protocol (MCP). Set it up once and every agent on your machine reads from and writes to the same memory.
 
 It's a single self-contained **Rust** binary over **SQLite + [sqlite-vec](https://github.com/asg017/sqlite-vec)**, with embeddings from a local **[llama.cpp](https://github.com/ggml-org/llama.cpp)** server. No Python, no cloud, no external database — your memories never leave your machine.
