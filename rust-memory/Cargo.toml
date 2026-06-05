@@ -2,7 +2,9 @@
 name = "opencode-memory"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.96"
+# MSRV: kept at the toolchain GitHub runners ship so the release build (which
+# verifies it) and `cargo install` work without a bleeding-edge rustc.
+rust-version = "1.95"
 description = "Persistent semantic memory for AI agents — a single self-contained stdio MCP server over SQLite + sqlite-vec with local llama.cpp embeddings."
 license = "MIT"
 authors = ["Rajarshi Ghoshal"]
