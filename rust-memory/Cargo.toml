@@ -57,6 +57,10 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# --- timestamps: created_at (epoch f64) + created_at_iso
-#     (Python datetime.utcfromtimestamp(ts).isoformat()+"Z", microsecond prec)
+# --- timestamps: created_at (epoch f64) + created_at_iso (UTC, microsecond prec)
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

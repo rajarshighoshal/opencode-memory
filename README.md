@@ -26,7 +26,26 @@ Agents forget everything between sessions. This gives them a durable, searchable
 
 The default embedding model is **Qwen3-Embedding-4B** (GGUF Q8_0, dim **2560**), auto-downloaded by llama.cpp on first run. **To use any other model, point `MCP_EXTERNAL_EMBEDDING_URL`/`MODEL` at it and set `MCP_EXTERNAL_EMBEDDING_DIM` to its width** — e.g. `all-MiniLM` (384), `text-embedding-3-small` (1536), BGE (1024). A freshly-created DB is built at that width; an existing DB keeps the width it was created with (auto-detected on open, with a warning if your configured dim disagrees).
 
-## Quick start
+## Install
+
+It's one self-contained binary — install it however you like:
+
+```bash
+# from crates.io
+cargo install opencode-memory
+
+# prebuilt binary (macOS / Linux) via the release installer
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/rajarshighoshal/opencode-memory/releases/latest/download/opencode-memory-installer.sh | sh
+
+# or with cargo-binstall (grabs the prebuilt binary, no compile)
+cargo binstall opencode-memory
+```
+
+You also need `llama-server` on `PATH` (`brew install llama.cpp`) — the binary starts it on demand. Then wire up your CLIs (see [Per-CLI setup](#per-cli-setup)).
+
+### Full setup from source
+
+For the batteries-included path — model pre-warm, the optional idle watchdog, the pre-push gate, and per-CLI config printed with paths filled in:
 
 ```bash
 git clone https://github.com/rajarshighoshal/opencode-memory.git
@@ -34,7 +53,7 @@ cd opencode-memory
 ./install.sh
 ```
 
-`install.sh` builds the Rust server, caches the embedding model, installs the optional idle watchdog (macOS launchd), activates the pre-push gate, and prints the config to paste into each CLI. It's idempotent — safe to re-run.
+`install.sh` is idempotent — safe to re-run.
 
 ## Per-CLI setup
 
@@ -100,6 +119,7 @@ The binary lazy-starts `llama-server` the first time it needs to embed, so nothi
 | `backup-memory.sh`, `maintain-memory.sh` | manual SQLite backup / maintenance (the binary also does this weekly) |
 | `install.sh`, `configs/` | setup + per-CLI config templates |
 | `.githooks/pre-push`, `.github/workflows/ci.yml` | build/test/clippy gates |
+| `rust-memory/dist-workspace.toml`, `.github/workflows/release.yml` | [cargo-dist](https://opensource.axo.dev/cargo-dist/) release: prebuilt binaries + installer on tag push |
 
 ## Development
 
