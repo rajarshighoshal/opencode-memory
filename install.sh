@@ -3,7 +3,8 @@
 # install.sh — set up opencode-memory for opencode / Claude Code / Codex.
 #
 # What it does (pure Rust, no Python):
-#   1. Verifies prerequisites (cargo/Rust, llama.cpp).
+#   1. Verifies cargo/Rust; installs llama.cpp if missing (Homebrew, else the
+#      distro package manager — best-effort, with a build-from-source fallback).
 #   2. Builds the Rust MCP server.
 #   3. Activates the pre-push gate (build/test/clippy + shell syntax).
 #   4. Caches the embedding model (llama.cpp auto-downloads the GGUF).
@@ -41,13 +42,31 @@ if ! command -v cargo >/dev/null 2>&1; then
   echo "ERROR: cargo/Rust not found. Install from https://rustup.rs" >&2; exit 1
 fi
 echo "    ✓ cargo: $(cargo --version)"
-if ! command -v llama-server >/dev/null 2>&1; then
-  echo "    llama.cpp not found."
+# Best-effort llama.cpp install. Package availability varies by distro, so we try
+# the managers that actually ship it (Homebrew on macOS/Linux, then the distro's)
+# and fall back to a build-from-source pointer. System managers need sudo.
+ensure_llamacpp() {
+  command -v llama-server >/dev/null 2>&1 && return 0
+  echo "    llama.cpp not found — attempting to install..."
   if command -v brew >/dev/null 2>&1; then
-    echo "    installing via brew..."; brew install llama.cpp
-  else
-    echo "ERROR: install llama.cpp (https://github.com/ggml-org/llama.cpp) so 'llama-server' is on PATH." >&2; exit 1
+    echo "    -> Homebrew: brew install llama.cpp";            brew install llama.cpp || true
+  elif command -v pacman >/dev/null 2>&1; then
+    echo "    -> pacman: sudo pacman -S llama.cpp";            sudo pacman -S --needed --noconfirm llama.cpp || true
+  elif command -v dnf >/dev/null 2>&1; then
+    echo "    -> dnf: sudo dnf install llama-cpp";             sudo dnf install -y llama-cpp || true
+  elif command -v nix >/dev/null 2>&1; then
+    echo "    -> nix: nix profile install nixpkgs#llama-cpp";  nix profile install nixpkgs#llama-cpp || true
   fi
+  command -v llama-server >/dev/null 2>&1
+}
+if ! ensure_llamacpp; then
+  echo "ERROR: couldn't get 'llama-server' on PATH automatically. Install llama.cpp, then re-run:" >&2
+  echo "         macOS:         brew install llama.cpp" >&2
+  echo "         Arch:          sudo pacman -S llama.cpp" >&2
+  echo "         Fedora:        sudo dnf install llama-cpp" >&2
+  echo "         Debian/Ubuntu: no distro package — use Homebrew on Linux or build from source" >&2
+  echo "         from source:   https://github.com/ggml-org/llama.cpp" >&2
+  exit 1
 fi
 echo "    ✓ llama-server: $(llama-server --version 2>&1 | head -1)"
 

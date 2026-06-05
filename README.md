@@ -32,24 +32,53 @@ The default embedding model is **Qwen3-Embedding-4B** (GGUF Q8_0, dim **2560**),
 
 ## Install
 
-It's one self-contained binary — install it however you like:
+It's one self-contained binary. Pick the install for your platform, then make sure `llama-server` is on `PATH` — the binary lazy-starts it the first time it needs to embed (nothing is resident until you use it). Prebuilt binaries cover `aarch64`/`x86_64` macOS and Linux. After installing, wire up your CLIs (see [Per-CLI setup](#per-cli-setup)).
+
+### macOS
 
 ```bash
-# from crates.io
-cargo install opencode-memory
-
-# prebuilt binary (macOS / Linux) via the release installer
+# prebuilt binary via the release installer (recommended)
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/rajarshighoshal/opencode-memory/releases/latest/download/opencode-memory-installer.sh | sh
 
-# or with cargo-binstall (grabs the prebuilt binary, no compile)
+# or, no compile, fetch the prebuilt binary
 cargo binstall opencode-memory
+
+# or compile from crates.io
+cargo install opencode-memory
 ```
 
-You also need `llama-server` on `PATH` (`brew install llama.cpp`) — the binary starts it on demand. Then wire up your CLIs (see [Per-CLI setup](#per-cli-setup)).
+Prerequisite:
 
-### Full setup from source
+```bash
+brew install llama.cpp
+```
 
-For the batteries-included path — model pre-warm, the optional idle watchdog, the pre-push gate, and per-CLI config printed with paths filled in:
+The binary starts `llama-server` on demand (on `:11434`); you never run it yourself. On first embed it downloads the default model (Qwen3-Embedding-4B, GGUF Q8_0, dim 2560).
+
+### Linux
+
+```bash
+# prebuilt binary via the release installer (recommended)
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/rajarshighoshal/opencode-memory/releases/latest/download/opencode-memory-installer.sh | sh
+
+# or, no compile, fetch the prebuilt binary
+cargo binstall opencode-memory
+
+# or compile from crates.io
+cargo install opencode-memory
+```
+
+Prerequisite: get `llama-server` onto your `PATH` yourself — build it from <https://github.com/ggml-org/llama.cpp> or install via your distro/package manager (there's no auto-install). The binary then starts it on demand (on `:11434`) and downloads the default model (Qwen3-Embedding-4B, GGUF Q8_0, dim 2560) on first embed.
+
+### Windows
+
+Not supported natively. The server reads `HOME` (not `USERPROFILE`) and hard-errors for global scope when it's unset, writes logs to `/tmp`, looks for a bare `llama-server` (not `llama-server.exe`) and falls back to a Homebrew path, and its helper scripts are bash — none of which is guarded for Windows, and no Windows binary is built.
+
+Use **WSL** (Windows Subsystem for Linux) and follow the [Linux](#linux) steps inside it.
+
+### From source
+
+For the batteries-included path on macOS/Linux — builds the release binary, pre-warms the model, installs the optional idle watchdog, activates the pre-push gate, and prints per-CLI config with paths filled in:
 
 ```bash
 git clone https://github.com/rajarshighoshal/opencode-memory.git
@@ -57,7 +86,7 @@ cd opencode-memory
 ./install.sh
 ```
 
-`install.sh` is idempotent — safe to re-run.
+`install.sh` is bash and idempotent — safe to re-run. It also installs llama.cpp for you when missing: Homebrew on macOS (or Linux), else your distro's package manager (`pacman`/`dnf`/`nix`) — best-effort, falling back to a build-from-source pointer if no package is available (e.g. Debian/Ubuntu).
 
 ## Per-CLI setup
 
