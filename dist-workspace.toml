@@ -1,5 +1,7 @@
 [workspace]
-members = ["cargo:."]
+# The cargo crate lives in the rust-memory/ subdirectory; this config sits at the
+# git root so cargo-dist's CI (which runs `dist host` from the repo root) finds it.
+members = ["cargo:rust-memory"]
 
 # Config for 'dist'
 [dist]
