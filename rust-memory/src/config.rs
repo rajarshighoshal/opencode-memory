@@ -19,6 +19,8 @@ pub const DEFAULT_EMBEDDING_DIM: usize = 2560;
 
 /// Default llama.cpp model repo (the `-hf` arg) the binary starts when the
 /// embedding server isn't already up. Override with `MEMORY_EMBED_REPO`.
+/// Used as a fallback for resolving the local GGUF path when
+/// `MEMORY_EMBED_MODEL_PATH` is not set.
 pub const DEFAULT_EMBED_REPO: &str = "Qwen/Qwen3-Embedding-4B-GGUF:Q8_0";
 
 /// Default local embedding-server port; matches the llama.cpp server the binary
@@ -70,8 +72,9 @@ pub struct EmbedConfig {
     /// Homebrew default. `None` means we can't self-start — we just wait for an
     /// externally-managed server to answer.
     pub llama_server: Option<PathBuf>,
-    /// llama.cpp model repo (`-hf`) for the built-in start. `MEMORY_EMBED_REPO`,
-    /// default [`DEFAULT_EMBED_REPO`].
+    /// llama.cpp model repo (`-hf` fallback) for the built-in start. `MEMORY_EMBED_REPO`,
+    /// default [`DEFAULT_EMBED_REPO`]. Also used to resolve the local GGUF path
+    /// from the HF cache when no explicit `MEMORY_EMBED_MODEL_PATH` is set.
     pub embed_repo: String,
     /// Port the local embedding server listens on (built-in start + `/health`
     /// polling). `MEMORY_EMBED_PORT`, else parsed from `url`, else [`DEFAULT_EMBED_PORT`].
@@ -250,6 +253,66 @@ impl Config {
         // 3. CWD as last resort.
         cwd.to_path_buf()
     }
+}
+
+/// Resolve the GGUF model file path for the built-in start (`-m`).
+///
+/// Precedence:
+///   1. `MEMORY_EMBED_MODEL_PATH` env var (must point to an existing .gguf).
+///   2. HF cache: `$HF_HOME/hub/models--<repo-slashes-to-dashes>/snapshots/<refs/main>/*.gguf`,
+///      preferring a filename containing the `:selector` portion of `embed_repo`.
+///
+/// Returns `None` when neither resolves — the caller then falls back to `-hf`
+/// (network download), which is the fragile path we're moving away from.
+///
+/// Called lazily from `spawn_llama_server` (not at config-build time) so a
+/// `prefetch` done after the binary started is picked up on the next spawn.
+pub(crate) fn resolve_model_path(embed_repo: &str) -> Option<PathBuf> {
+    // 1. Explicit override.
+    if let Some(p) = std::env::var_os("MEMORY_EMBED_MODEL_PATH") {
+        let path = PathBuf::from(p);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    // 2. Resolve from the HF cache.
+    //    Check HF_HOME first (explicit override), then fall back to
+    //    $HOME/.cache/huggingface. Checking HF_HOME first avoids an
+    //    early-return when HF_HOME is set but HOME is unset.
+    let cache_root = std::env::var_os("HF_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(|h| PathBuf::from(h).join(".cache/huggingface"))
+        })?;
+    let (repo, selector) = embed_repo.split_once(':').unwrap_or((embed_repo, ""));
+    let cache_dir = cache_root
+        .join("hub")
+        .join(format!("models--{}", repo.replace('/', "--")));
+    let snapshot = std::fs::read_to_string(cache_dir.join("refs/main"))
+        .ok()?
+        .trim()
+        .to_string();
+    let snap_dir = cache_dir.join("snapshots").join(&snapshot);
+    // Find a .gguf, preferring one whose name contains the selector (e.g. "Q8_0").
+    // Sort entries by filename for deterministic tie-breaking (matches the
+    // shell script's `ls` which sorts alphabetically).
+    let mut entries: Vec<_> = std::fs::read_dir(&snap_dir).ok()?.flatten().collect();
+    entries.sort_by_key(|e| e.file_name());
+    let mut fallback: Option<PathBuf> = None;
+    for entry in &entries {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("gguf") && path.is_file() {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if !selector.is_empty() && name.contains(selector) {
+                return Some(path);
+            }
+            if fallback.is_none() {
+                fallback = Some(path);
+            }
+        }
+    }
+    fallback
 }
 
 /// Locate the `llama-server` binary for the built-in embedding start: explicit

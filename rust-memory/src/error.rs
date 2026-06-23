@@ -35,6 +35,10 @@ pub enum EmbedError {
     /// Embedding contained NaN/Inf; vectors must be all-finite before storing.
     #[error("embedding contained non-finite value")]
     NonFinite,
+
+    /// Model file failed sha256 integrity check — refuse to serve NaN.
+    #[error("model file corrupt: {0}")]
+    CorruptModel(String),
 }
 
 /// Top-level error for storage operations and server wiring.

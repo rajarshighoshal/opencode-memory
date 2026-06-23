@@ -7,7 +7,8 @@
 #      distro package manager — best-effort, with a build-from-source fallback).
 #   2. Builds the Rust MCP server.
 #   3. Activates the pre-push gate (build/test/clippy + shell syntax).
-#   4. Caches the embedding model (llama.cpp auto-downloads the GGUF).
+#   4. Pre-fetches the embedding GGUF via `hf download` (sha256-verified), not
+#      llama.cpp's -hf auto-downloader.
 #   5. Creates the global memory directory.
 #   6. Installs the OPTIONAL llama-embed watchdog (stop-when-idle; the binary
 #      already lazy-starts the server itself).
@@ -100,20 +101,27 @@ if [ -d "$SCRIPT_DIR/.git" ] && [ -f "$SCRIPT_DIR/.githooks/pre-push" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 4. Pre-warm the embedding model (llama.cpp auto-downloads the GGUF)
+# 4. Pre-warm the embedding model (sha256-verified download via `hf`, not -hf)
 # ---------------------------------------------------------------------------
-echo "==> Pre-warming embedding model ($EMBEDDING_MODEL via llama.cpp)"
+echo "==> Pre-warming embedding model ($EMBEDDING_MODEL)"
 chmod +x "$SCRIPT_DIR/llama-embed.sh" "$SCRIPT_DIR/memory-mcp" \
          "$SCRIPT_DIR/llama-embed-watchdog.sh" "$SCRIPT_DIR/doctor.sh" \
          "$SCRIPT_DIR/backup-memory.sh" "$SCRIPT_DIR/maintain-memory.sh"
-# `ensure` returns 0 even if it timed out waiting for /health (a cold multi-GB
-# model download can exceed the readiness window), so re-probe status to report
-# honestly rather than printing a false success.
+# `prefetch` downloads via `hf download` (sha256-verified, atomic) — NOT
+# llama.cpp's -hf downloader, which does a network validation call on every
+# start and can corrupt the cached file. If the model is already cached and
+# passes integrity check, this is a no-op.
+"$SCRIPT_DIR/llama-embed.sh" prefetch || true
+# `ensure` starts the server and waits for /health readiness. It returns 0
+# even if it timed out, so re-probe status to report honestly.
 "$SCRIPT_DIR/llama-embed.sh" ensure || true
 if [ "$("$SCRIPT_DIR/llama-embed.sh" status 2>/dev/null)" = "up" ]; then
   echo "    ✓ model cached + endpoint verified"
+elif ! command -v hf >/dev/null 2>&1; then
+  echo "    ⚠ 'hf' CLI missing, so 'prefetch' was skipped — install it (pip install huggingface_hub) and re-run to pre-fetch + sha256-verify the model."
+  echo "      If no model is cached yet, the server will -hf download on the first embedding call (slower, unverified)."
 else
-  echo "    ⚠ model still downloading / not ready in ${MEMORY_EMBED_READY_TIMEOUT:-40}s — the first embedding call may block while it finishes"
+  echo "    ⚠ model not ready in ${MEMORY_EMBED_READY_TIMEOUT:-40}s — a cold download may still be finishing; the first embedding call may block."
 fi
 "$SCRIPT_DIR/llama-embed.sh" stop || true
 

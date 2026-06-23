@@ -18,6 +18,7 @@
 use crate::config::EmbedConfig;
 use crate::error::EmbedError;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use std::path::Path;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -233,7 +234,9 @@ impl EmbedClient {
         let local = self.url_is_loopback();
         match self.cfg.llama_server {
             Some(ref bin) if local => {
-                self.spawn_llama_server(bin);
+                // spawn_llama_server returns Err(CorruptModel) if sha256 fails —
+                // propagate so the caller sees a clear error instead of NaN.
+                self.spawn_llama_server(bin).await?;
                 self.wait_until_ready().await;
             }
             _ if !local => {
@@ -295,12 +298,23 @@ impl EmbedClient {
     }
 
     /// Spawn `llama-server` with the throughput-tuned embedding flags (mirrors the
-    /// bundled `llama-embed.sh`). A detached reaper thread `wait()`s on the child so
-    /// it never becomes a zombie if it later exits (crash / idle watchdog) during
-    /// this process's lifetime; if this process exits first the child is reparented
-    /// to init, which reaps it. stdio goes to `/tmp/llama-embed.log` for triage.
-    fn spawn_llama_server(&self, bin: &Path) {
+    /// bundled `llama-embed.sh`). Uses `-m <path>` when a local GGUF is resolved
+    /// (zero network I/O, no fragile `-hf` downloader); falls back to `-hf` only
+    /// when no local file is found. The model path is resolved **lazily** (not at
+    /// config-build time) so a `prefetch` done after the binary started is picked
+    /// up on the next spawn. sha256 integrity is verified before serving — a
+    /// corrupt model fails loudly instead of silently producing NaN embeddings.
+    ///
+    /// Returns `Err(CorruptModel)` if the sha256 check fails, so the caller can
+    /// surface a clear error instead of the old "invalid JSON" confusion.
+    ///
+    /// A detached reaper thread `wait()`s on the child so it never becomes a
+    /// zombie if it later exits (crash / idle watchdog) during this process's
+    /// lifetime; if this process exits first the child is reparented to init,
+    /// which reaps it. stdio goes to `/tmp/llama-embed.log` for triage.
+    async fn spawn_llama_server(&self, bin: &Path) -> Result<(), EmbedError> {
         use std::process::{Command, Stdio};
+
         let port = self.cfg.embed_port.to_string();
         let (out, err) = match std::fs::OpenOptions::new()
             .create(true)
@@ -313,36 +327,48 @@ impl EmbedClient {
             },
             Err(_) => (Stdio::null(), Stdio::null()),
         };
-        let spawned = Command::new(bin)
-            .args([
-                "-hf",
-                &self.cfg.embed_repo,
-                "--embedding",
-                "--pooling",
-                "last",
-                "--host",
-                "127.0.0.1",
-                "--port",
-                &port,
-                "-c",
-                "16384",
-                "-b",
-                "8192",
-                "-ub",
-                "2048",
-                "--parallel",
-                "8",
-            ])
+
+        // Lazily resolve the model path (not at config-build time) so a prefetch
+        // done after the binary started is picked up on the next spawn.
+        let model_path = crate::config::resolve_model_path(&self.cfg.embed_repo);
+
+        let mut cmd = Command::new(bin);
+        cmd.args(["--embedding", "--pooling", "last", "--host", "127.0.0.1", "--port", &port]);
+
+        // Verify sha256 (if HF cache file) and set -m or -hf.
+        match &model_path {
+            Some(path) => {
+                // Run the blocking sha256 hash on a spawn_blocking thread
+                // so we don't stall the tokio worker for ~7.5s.
+                let path_clone = path.clone();
+                verify_model_integrity(path_clone).await?;
+                cmd.arg("-m").arg(path);
+            }
+            None => {
+                cmd.arg("-hf").arg(&self.cfg.embed_repo);
+            }
+        }
+
+        cmd.args(["-c", "16384", "-b", "8192", "-ub", "2048", "--parallel", "8"])
             .stdin(Stdio::null())
             .stdout(out)
-            .stderr(err)
-            .spawn();
-        match spawned {
+            .stderr(err);
+
+        match cmd.spawn() {
             Ok(mut child) => {
-                tracing::info!(
-                    bin = %bin.display(), repo = %self.cfg.embed_repo, port = %port,
-                    "started embedding server (llama-server)"
-                );
+                // Log AFTER successful spawn — not before — so we don't claim
+                // success if the spawn failed.
+                match &model_path {
+                    Some(path) => tracing::info!(
+                        bin = %bin.display(), model = %path.display(), port = %port,
+                        "started embedding server (llama-server, -m local file)"
+                    ),
+                    None => tracing::warn!(
+                        bin = %bin.display(), repo = %self.cfg.embed_repo, port = %port,
+                        "started embedding server (llama-server, -hf fallback — no local model \
+                         found, set MEMORY_EMBED_MODEL_PATH or run `llama-embed.sh prefetch`)"
+                    ),
+                }
                 // Reap on exit so a crashed/idle-stopped server doesn't linger as a zombie.
                 std::thread::spawn(move || {
                     let _ = child.wait();
@@ -352,6 +378,7 @@ impl EmbedClient {
                 tracing::warn!(bin = %bin.display(), error = %e, "failed to spawn llama-server")
             }
         }
+        Ok(())
     }
 
     /// Poll `/health` once a second until ready or `ready_timeout_secs` elapses.
@@ -374,6 +401,95 @@ impl EmbedClient {
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
     }
+}
+
+/// Verify model file integrity via sha256. Uses a stamp file so the expensive
+/// (~4-8s for 4.28 GB) hash computation runs only once per file version.
+///
+/// The sha256 hash runs on a `spawn_blocking` thread so the tokio worker
+/// is not stalled during the ~7.5s computation.
+///
+/// HF LFS convention: the blob filename IS the content sha256. We resolve the
+/// symlink, compare the blob filename to the actual sha256, and cache the
+/// result in `<model_path>.verified` containing "<size>:<mtime_secs>".
+/// On subsequent calls, if the stamp matches, we skip verification.
+///
+/// For files outside the HF cache (filename isn't a 64-char hex string),
+/// verification is skipped — we can't know the expected hash.
+async fn verify_model_integrity(path: PathBuf) -> Result<(), EmbedError> {
+    tokio::task::spawn_blocking(move || verify_model_integrity_blocking(&path))
+        .await
+        .map_err(|e| EmbedError::CorruptModel(format!("verify task panicked: {e}")))?
+}
+
+fn verify_model_integrity_blocking(path: &Path) -> Result<(), EmbedError> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    use std::time::UNIX_EPOCH;
+
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let stamp_path = path.with_file_name(format!("{file_name}.verified"));
+
+    let metadata = std::fs::metadata(path)
+        .map_err(|e| EmbedError::CorruptModel(format!("cannot stat model file: {e}")))?;
+    let mtime = metadata
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let stamp_key = format!("{}:{}", metadata.len(), mtime);
+
+    // Fast path: stamp exists and matches — file unchanged since last verify.
+    if let Ok(stamp) = std::fs::read_to_string(&stamp_path) {
+        if stamp.trim() == stamp_key {
+            return Ok(());
+        }
+    }
+
+    // Resolve symlink → blob path. HF LFS: blob filename = expected sha256.
+    let real_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let expected_sha = real_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+
+    // If the filename isn't a 64-char hex string, it's not an HF cache blob —
+    // can't verify, so trust the user's explicit path and write a stamp.
+    if expected_sha.len() != 64 || !expected_sha.chars().all(|c| c.is_ascii_hexdigit()) {
+        let _ = std::fs::write(&stamp_path, &stamp_key);
+        return Ok(());
+    }
+
+    // Slow path: compute sha256 and compare to the blob filename.
+    tracing::info!(path = %path.display(), "verifying model integrity (sha256)...");
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| EmbedError::CorruptModel(format!("cannot open model file: {e}")))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 1024 * 1024]; // 1 MB buffer — memory-efficient for 4+ GB files
+    loop {
+        let n = file
+            .read(&mut buffer)
+            .map_err(|e| EmbedError::CorruptModel(format!("read error: {e}")))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buffer[..n]);
+    }
+    let actual_sha = hex::encode(hasher.finalize());
+
+    if actual_sha != expected_sha {
+        return Err(EmbedError::CorruptModel(format!(
+            "sha256 mismatch: expected {expected_sha}, got {actual_sha} — \
+             run `llama-embed.sh prefetch` to re-download"
+        )));
+    }
+
+    let _ = std::fs::write(&stamp_path, &stamp_key);
+    Ok(())
 }
 
 /// Reorder a chunk's items by their `index` field into a dense `Vec`, validating
