@@ -166,7 +166,9 @@ impl Config {
 
         let timeout_secs = std::env::var("MCP_EXTERNAL_EMBEDDING_TIMEOUT")
             .ok()
-            .and_then(|s| s.parse().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+            // `> 0` like the siblings: a 0 timeout instant-fails every request.
+            .filter(|t| *t > 0)
             .unwrap_or(60);
         let embedding_dim = std::env::var("MCP_EXTERNAL_EMBEDDING_DIM")
             .ok()

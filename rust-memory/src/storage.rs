@@ -64,6 +64,12 @@ fn now_epoch() -> f64 {
         })
 }
 
+/// Opt-in (`MCP_EVICTION_ENABLED`): when on, search stamps `last_accessed` so
+/// eviction can spare recently-used memories. Off by default = no read-path writes.
+fn access_tracking_enabled() -> bool {
+    crate::evict::eviction_enabled()
+}
+
 /// Recency half-life in days for the optional search reweight; 0 (default) = off.
 /// A research knowledge base should not auto-forget, so created-at decay is opt-in.
 fn recency_halflife_days() -> f64 {
@@ -93,11 +99,14 @@ fn apply_recency(hits: &mut [SearchHit], halflife_days: f64) {
     });
 }
 
-/// Parse a `YYYY-MM-DD` (or full ISO) date bound to epoch seconds for the
-/// `after`/`before` filters, treating naive datetimes as UTC.
+/// Parse a `YYYY-MM-DD` or ISO-8601/RFC 3339 date bound to epoch seconds.
 fn parse_iso_date_to_epoch(s: &str) -> Option<f64> {
-    use chrono::{NaiveDate, NaiveDateTime, TimeZone, Utc};
-    // Try full datetime first, then date-only at midnight UTC.
+    use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
+    // RFC 3339 first: this is what epoch_to_iso emits (trailing `Z`), so the
+    // server's own timestamps round-trip.
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        return Some(dt.timestamp() as f64);
+    }
     if let Ok(ndt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S") {
         return Some(Utc.from_utc_datetime(&ndt).timestamp() as f64);
     }
@@ -106,6 +115,22 @@ fn parse_iso_date_to_epoch(s: &str) -> Option<f64> {
         return Some(Utc.from_utc_datetime(&ndt).timestamp() as f64);
     }
     None
+}
+
+/// Parse an optional date bound, failing CLOSED: an unparseable string errors
+/// rather than being dropped. A dropped bound in `delete()` would collapse the
+/// WHERE to match-all and wipe the scope.
+fn parse_bound(label: &str, value: &Option<String>) -> Result<Option<f64>> {
+    match value {
+        None => Ok(None),
+        Some(s) => match parse_iso_date_to_epoch(s) {
+            Some(ts) => Ok(Some(ts)),
+            None => Err(MemoryError::InvalidArg(format!(
+                "invalid `{label}` date {s:?}; expected YYYY-MM-DD or ISO-8601 \
+                 (e.g. 2024-06-03 or 2024-06-03T14:30:00Z)"
+            ))),
+        },
+    }
 }
 
 /// Register the statically-linked sqlite-vec extension as a SQLite
@@ -146,6 +171,8 @@ pub struct Storage {
     semantic_dedup_enabled: bool,
     semantic_dedup_threshold: f64,
     semantic_dedup_time_window_hours: f64,
+    /// Opt-in (`MCP_EVICTION_ENABLED`): stamp `last_accessed` on search hits.
+    track_access: bool,
 }
 
 /// Semantic-dedup settings resolved from the environment.
@@ -398,6 +425,7 @@ impl Storage {
             semantic_dedup_enabled: dedup.enabled,
             semantic_dedup_threshold: dedup.threshold,
             semantic_dedup_time_window_hours: dedup.time_window_hours,
+            track_access: access_tracking_enabled(),
         })
     }
 
@@ -405,6 +433,12 @@ impl Storage {
     /// configured dim for a fresh DB).
     pub fn embedding_dim(&self) -> usize {
         self.embedding_dim
+    }
+
+    /// Test-only: force access-tracking without touching the environment.
+    #[cfg(test)]
+    pub(crate) fn set_track_access(&mut self, on: bool) {
+        self.track_access = on;
     }
 
     /// `vec_version()` — for the health check + startup self-test.
@@ -570,9 +604,14 @@ impl Storage {
             return Ok(Vec::new());
         }
 
-        // k_value: when tags/time filters are present we must scan more candidates
-        // since membership is orthogonal to similarity. Cap at MAX_KNN_K.
-        let k_value: i64 = if !q.tags.is_empty() || q.after.is_some() || q.before.is_some() {
+        // Widen k when any post-KNN filter is active (tags/time/superseded), else
+        // filtered-out rows shrink the result below `limit`. Superseded rows keep
+        // their embeddings, so they occupy slots too. Cap at MAX_KNN_K.
+        let k_value: i64 = if !q.tags.is_empty()
+            || q.after.is_some()
+            || q.before.is_some()
+            || !q.include_superseded
+        {
             embedding_count.min(MAX_KNN_K as i64)
         } else {
             (q.limit as i64).min(MAX_KNN_K as i64)
@@ -603,7 +642,7 @@ impl Storage {
                 .map(|tag| {
                     params.push(rusqlite::types::Value::Text(format!(
                         "%,{},%",
-                        escape_like(tag.trim())
+                        escape_like(&tag.trim().replace(' ', ""))
                     )));
                     "(',' || REPLACE(m.tags, ' ', '') || ',') LIKE ? ESCAPE '\\'".to_string()
                 })
@@ -612,19 +651,15 @@ impl Storage {
             tag_conditions = format!(" AND ({})", clauses.join(joiner));
         }
 
-        // Time filters at SQL level (created_at >= / <=).
+        // Time filters, failing closed on an unparseable bound.
         let mut time_conditions = String::new();
-        if let Some(after) = &q.after {
-            if let Some(ts) = parse_iso_date_to_epoch(after) {
-                time_conditions.push_str(" AND m.created_at >= ?");
-                params.push(rusqlite::types::Value::Real(ts));
-            }
+        if let Some(ts) = parse_bound("after", &q.after)? {
+            time_conditions.push_str(" AND m.created_at >= ?");
+            params.push(rusqlite::types::Value::Real(ts));
         }
-        if let Some(before) = &q.before {
-            if let Some(ts) = parse_iso_date_to_epoch(before) {
-                time_conditions.push_str(" AND m.created_at <= ?");
-                params.push(rusqlite::types::Value::Real(ts));
-            }
+        if let Some(ts) = parse_bound("before", &q.before)? {
+            time_conditions.push_str(" AND m.created_at <= ?");
+            params.push(rusqlite::types::Value::Real(ts));
         }
 
         params.push(rusqlite::types::Value::Integer(q.limit as i64));
@@ -678,7 +713,7 @@ impl Storage {
                 .map(|tag| {
                     params.push(rusqlite::types::Value::Text(format!(
                         "%,{},%",
-                        escape_like(tag.trim())
+                        escape_like(&tag.trim().replace(' ', ""))
                     )));
                     "(',' || REPLACE(m.tags, ' ', '') || ',') LIKE ? ESCAPE '\\'".to_string()
                 })
@@ -687,18 +722,15 @@ impl Storage {
             tag_conditions = format!(" AND ({})", clauses.join(joiner));
         }
 
+        // Time filters, failing closed on an unparseable bound.
         let mut time_conditions = String::new();
-        if let Some(after) = &q.after {
-            if let Some(ts) = parse_iso_date_to_epoch(after) {
-                time_conditions.push_str(" AND m.created_at >= ?");
-                params.push(rusqlite::types::Value::Real(ts));
-            }
+        if let Some(ts) = parse_bound("after", &q.after)? {
+            time_conditions.push_str(" AND m.created_at >= ?");
+            params.push(rusqlite::types::Value::Real(ts));
         }
-        if let Some(before) = &q.before {
-            if let Some(ts) = parse_iso_date_to_epoch(before) {
-                time_conditions.push_str(" AND m.created_at <= ?");
-                params.push(rusqlite::types::Value::Real(ts));
-            }
+        if let Some(ts) = parse_bound("before", &q.before)? {
+            time_conditions.push_str(" AND m.created_at <= ?");
+            params.push(rusqlite::types::Value::Real(ts));
         }
 
         params.push(rusqlite::types::Value::Integer(q.limit as i64));
@@ -743,7 +775,35 @@ impl Storage {
         };
         // Optional recency reweight (off unless MCP_RECENCY_HALFLIFE_DAYS > 0).
         apply_recency(&mut hits, recency_halflife_days());
+        // Opt-in: reinforce surfaced hits for the eviction pass.
+        if self.track_access && !hits.is_empty() {
+            let hashes: Vec<String> = hits.iter().map(|h| h.memory.content_hash.clone()).collect();
+            self.touch_accessed(&hashes);
+        }
         Ok(hits)
+    }
+
+    /// Best-effort stamp of `last_accessed` for the eviction pass. Failures are
+    /// logged, not propagated — a telemetry write must not fail a search.
+    fn touch_accessed(&self, hashes: &[String]) {
+        if hashes.is_empty() {
+            return;
+        }
+        let now = now_epoch() as i64;
+        let placeholders = vec!["?"; hashes.len()].join(",");
+        let sql = format!(
+            "UPDATE memories SET last_accessed = ? \
+             WHERE deleted_at IS NULL AND content_hash IN ({placeholders})"
+        );
+        let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(hashes.len() + 1);
+        params.push(rusqlite::types::Value::Integer(now));
+        for h in hashes {
+            params.push(rusqlite::types::Value::Text(h.clone()));
+        }
+        let conn = self.conn.lock().unwrap();
+        if let Err(e) = conn.execute(&sql, params_from_iter(params.iter())) {
+            tracing::debug!(error = %e, "failed to stamp last_accessed (non-fatal)");
+        }
     }
 
     /// Exact search (`mode: exact`): a case-insensitive substring match on content
@@ -927,7 +987,7 @@ impl Storage {
                 .map(|tag| {
                     params.push(rusqlite::types::Value::Text(format!(
                         "%,{},%",
-                        escape_like(tag.trim())
+                        escape_like(&tag.trim().replace(' ', ""))
                     )));
                     "(',' || REPLACE(m.tags, ' ', '') || ',') LIKE ? ESCAPE '\\'".to_string()
                 })
@@ -1054,6 +1114,11 @@ impl Storage {
             });
         }
 
+        // Parse bounds BEFORE the guard: a dropped bad bound would collapse the
+        // WHERE to match-all and wipe the scope.
+        let after_ts = parse_bound("after", &q.after)?;
+        let before_ts = parse_bound("before", &q.before)?;
+
         // Case 2: no filters at all -> mass-delete guard.
         if q.tags.is_empty() && q.before.is_none() && q.after.is_none() {
             return Err(MemoryError::InvalidArg(
@@ -1074,24 +1139,20 @@ impl Storage {
                 .map(|tag| {
                     sel_params.push(rusqlite::types::Value::Text(format!(
                         "%,{},%",
-                        escape_like(tag.trim())
+                        escape_like(&tag.trim().replace(' ', ""))
                     )));
                     "(',' || REPLACE(tags, ' ', '') || ',') LIKE ? ESCAPE '\\'".to_string()
                 })
                 .collect();
             conditions.push(format!("({})", clauses.join(joiner)));
         }
-        if let Some(after) = &q.after {
-            if let Some(ts) = parse_iso_date_to_epoch(after) {
-                conditions.push("created_at >= ?".to_string());
-                sel_params.push(rusqlite::types::Value::Real(ts));
-            }
+        if let Some(ts) = after_ts {
+            conditions.push("created_at >= ?".to_string());
+            sel_params.push(rusqlite::types::Value::Real(ts));
         }
-        if let Some(before) = &q.before {
-            if let Some(ts) = parse_iso_date_to_epoch(before) {
-                conditions.push("created_at <= ?".to_string());
-                sel_params.push(rusqlite::types::Value::Real(ts));
-            }
+        if let Some(ts) = before_ts {
+            conditions.push("created_at <= ?".to_string());
+            sel_params.push(rusqlite::types::Value::Real(ts));
         }
         let where_clause = conditions.join(" AND ");
 
@@ -2335,5 +2396,162 @@ mod tests {
         assert_eq!(st.total_memories, 2);
         assert_eq!(st.embedding_model, "test-model");
         assert_eq!(st.embedding_dimension, 2560);
+    }
+
+    // ––– regression (bug-hunt) –––
+
+    /// A "…Z" bound (the server's own output) must not collapse the delete filter
+    /// to match-all and wipe the scope.
+    #[test]
+    fn delete_zulu_bound_does_not_wipe_scope() {
+        let s = open_test_storage();
+        store_mem(&s, "keep-a", 1, &[], None);
+        store_mem(&s, "keep-b", 2, &[], None);
+        // Everything was created "now"; deleting before the year 2000 matches nothing.
+        let outcome = s
+            .delete(&DeleteQuery {
+                content_hash: None,
+                tags: vec![],
+                tag_match: TagMatch::Any,
+                before: Some("2000-01-01T00:00:00Z".to_string()),
+                after: None,
+                dry_run: false,
+            })
+            .unwrap();
+        assert_eq!(outcome.deleted_count, 0, "a past bound must not match recent memories");
+        assert_eq!(s.list(&lq(1, 10)).unwrap().total, 2, "no memory should have been deleted");
+    }
+
+    /// An unparseable bound errors instead of bypassing the mass-delete guard.
+    #[test]
+    fn delete_unparseable_bound_errors_not_wipes() {
+        let s = open_test_storage();
+        store_mem(&s, "keep-a", 1, &[], None);
+        store_mem(&s, "keep-b", 2, &[], None);
+        let err = s
+            .delete(&DeleteQuery {
+                content_hash: None,
+                tags: vec![],
+                tag_match: TagMatch::Any,
+                before: Some("13/40/2024".to_string()),
+                after: None,
+                dry_run: false,
+            })
+            .unwrap_err();
+        assert!(matches!(err, MemoryError::InvalidArg(_)));
+        assert_eq!(s.list(&lq(1, 10)).unwrap().total, 2, "nothing deleted on a bad bound");
+    }
+
+    #[test]
+    fn search_superseded_does_not_hide_live_results() {
+        let s = open_test_storage();
+        // x is nearest to the seed-1 query; y is orthogonal (farther).
+        let x = store_mem(&s, "x content", 1, &[], None);
+        let _y = store_mem(&s, "y content", 2, &[], None);
+        // Supersede x; its embedding stays, so it still occupies a KNN slot.
+        s.mark_superseded(&x, "newhash_for_x").unwrap();
+        // limit=1: pre-fix the superseded row took the only slot → 0 hits.
+        let hits = s
+            .search(&sq("x content", SearchMode::Semantic, 1), Some(&seeded_embed(1)))
+            .unwrap();
+        assert!(!hits.is_empty(), "a superseded near-neighbor must not hide the live result");
+        assert!(hits.iter().all(|h| h.memory.content_hash != x), "superseded row must stay hidden");
+    }
+
+    #[test]
+    fn search_rejects_unparseable_bound() {
+        let s = open_test_storage();
+        store_mem(&s, "hello", 1, &[], None);
+        let mut q = sq("hello", SearchMode::Semantic, 5);
+        q.before = Some("not-a-date".to_string());
+        let err = s.search(&q, Some(&seeded_embed(1))).unwrap_err();
+        assert!(matches!(err, MemoryError::InvalidArg(_)));
+    }
+
+    #[test]
+    fn tag_filter_matches_tag_with_internal_space() {
+        let s = open_test_storage();
+        store_mem(&s, "ml note", 1, &["machine learning"], None);
+        // Search side (KNN path).
+        let mut q = sq("ml note", SearchMode::Semantic, 5);
+        q.tags = vec!["machine learning".to_string()];
+        let hits = s.search(&q, Some(&seeded_embed(1))).unwrap();
+        assert_eq!(hits.len(), 1, "tag with an internal space must match by its own spelling");
+        // List/browse side.
+        let mut lqy = lq(1, 10);
+        lqy.tags = vec!["machine learning".to_string()];
+        assert_eq!(s.list(&lqy).unwrap().memories.len(), 1);
+    }
+
+    #[test]
+    fn parse_iso_accepts_rfc3339() {
+        assert_eq!(parse_iso_date_to_epoch("2024-06-03T16:00:00Z"), Some(1717430400.0));
+        assert_eq!(parse_iso_date_to_epoch("2024-06-03"), Some(1717372800.0));
+        assert_eq!(parse_iso_date_to_epoch("2024-06-03T16:00:00+00:00"), Some(1717430400.0));
+        assert!(parse_iso_date_to_epoch("13/40/2024").is_none());
+    }
+
+    /// End-to-end: real file DB, a real search that reinforces one memory, then a
+    /// real eviction pass. Exercises the full search→last_accessed→evict wiring.
+    #[test]
+    fn eviction_end_to_end_reinforcement() {
+        let path = std::env::temp_dir().join(format!("evict-e2e-{}.db", std::process::id()));
+        for sfx in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{sfx}", path.display()));
+        }
+        let mut cfg = crate::test_util::test_config(crate::config::Scope::Project);
+        cfg.db_path = path.clone();
+
+        let mut s = Storage::open(&cfg).unwrap();
+        s.set_track_access(true);
+        let recent = store_mem(&s, "recent note", 1, &[], None);
+        let old_untouched = store_mem(&s, "old untouched", 2, &[], None);
+        let old_searched = store_mem(&s, "old but searched", 3, &[], None);
+
+        // Backdate the two "old" memories ~500 days.
+        let old_ts = now_epoch() - 500.0 * 86_400.0;
+        {
+            let conn = s.conn.lock().unwrap();
+            for h in [&old_untouched, &old_searched] {
+                conn.execute(
+                    "UPDATE memories SET created_at = ?1 WHERE content_hash = ?2",
+                    rusqlite::params![old_ts, h],
+                )
+                .unwrap();
+            }
+        }
+
+        // A real search surfaces only old_searched (limit 1) → stamps last_accessed.
+        let hits = s
+            .search(&sq("old but searched", SearchMode::Semantic, 1), Some(&seeded_embed(3)))
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].memory.content_hash, old_searched);
+        drop(s);
+
+        let params = crate::evict::EvictionParams {
+            enabled: true,
+            ..Default::default()
+        };
+        let report = crate::evict::run(&path.to_string_lossy(), &params, false).unwrap();
+        assert_eq!(report.evicted, 1, "only old + untouched should be evicted");
+
+        let s2 = Storage::open(&cfg).unwrap();
+        let live: Vec<String> = {
+            let conn = s2.conn.lock().unwrap();
+            let mut stmt = conn
+                .prepare("SELECT content_hash FROM memories WHERE deleted_at IS NULL")
+                .unwrap();
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+            rows.map(|r| r.unwrap()).collect()
+        };
+        assert!(live.contains(&recent), "recent survives (age floor)");
+        assert!(live.contains(&old_searched), "reinforced-by-search survives");
+        assert!(!live.contains(&old_untouched), "old + untouched evicted");
+
+        drop(s2);
+        for sfx in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{sfx}", path.display()));
+        }
     }
 }

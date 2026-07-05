@@ -110,6 +110,19 @@ Because the binary is self-contained, **the command is the only required setting
 
 Optional recency reweight: set `MCP_RECENCY_HALFLIFE_DAYS=N` to decay relevance by age (off by default).
 
+## Lifecycle / eviction (opt-in)
+
+By default the store is **purely additive** — nothing is ever auto-forgotten. To cap unbounded growth, enable a weekly **soft-eviction** pass with `MCP_EVICTION_ENABLED=true`. It removes only memories that are *both* old **and** low-salience, and reinforces anything you actually use — search stamps `last_accessed`, which slows decay. Eviction soft-deletes like `memory_delete`: the content is tombstoned (recoverable), but the memory's embedding + graph edges are dropped. The first weekly pass after enabling only establishes a baseline — it evicts nothing. All tunables have conservative defaults:
+
+| env | default | meaning |
+|---|---|---|
+| `MCP_EVICTION_ENABLED` | `false` | master switch (opt-in) |
+| `MCP_EVICTION_MAX_AGE_DAYS` | `365` | never evict anything younger than this, whatever its salience |
+| `MCP_EVICTION_HALFLIFE_DAYS` | `90` | idle salience halves every this-many days |
+| `MCP_EVICTION_MIN_SALIENCE` | `0.05` | evict only below this decayed salience |
+
+Salience = `confidence · 0.5^(idle_days / halflife)`, where `idle_days` counts from the later of a memory's creation or its last retrieval.
+
 ## Graph actions (`memory_graph` `action`)
 
 | action | args (defaults) | returns |

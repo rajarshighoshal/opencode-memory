@@ -44,6 +44,7 @@ fn run_due(db_path: &Path) {
     backup_if_due(db_path, &db_dir);
     maintain_if_due(db_path, &db_dir);
     consolidate_if_due(db_path, &db_dir);
+    evict_if_due(db_path, &db_dir);
 }
 
 /// Current wall-clock epoch seconds.
@@ -250,6 +251,34 @@ fn consolidate_if_due(db_path: &Path, db_dir: &Path) {
             "weekly association-graph consolidation done"
         ),
         Err(e) => tracing::warn!(error = %e, "weekly consolidation failed"),
+    }
+}
+
+/// Weekly opt-in eviction (off unless `MCP_EVICTION_ENABLED=true`). Gate checked
+/// first so a disabled install never locks or stamps.
+fn evict_if_due(db_path: &Path, db_dir: &Path) {
+    let params = crate::evict::EvictionParams::from_env();
+    if !params.enabled {
+        return; // opt-in; default off
+    }
+    let stamp = db_dir.join(".weekly-evict.stamp");
+    // A missing stamp means this is the first-ever pass → seed a reinforcement
+    // baseline instead of grading a corpus that has no access history yet.
+    let first_run = !stamp.exists();
+    if !is_due(&stamp, WEEK_SECS) {
+        return;
+    }
+    let Some(_lock) = DirLock::try_acquire(db_dir.join(".evict.lock")) else {
+        return;
+    };
+    stamp_now(&stamp);
+    match crate::evict::run(&db_path.to_string_lossy(), &params, first_run) {
+        Ok(r) => tracing::info!(
+            scanned = r.scanned,
+            evicted = r.evicted,
+            "weekly eviction pass done"
+        ),
+        Err(e) => tracing::warn!(error = %e, "weekly eviction failed"),
     }
 }
 
