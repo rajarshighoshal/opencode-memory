@@ -1,6 +1,6 @@
 [package]
 name = "opencode-memory"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 # MSRV: kept at the toolchain GitHub runners ship so `cargo install` works without a
 # bleeding-edge rustc. The CI `msrv` job pins 1.95.0 and `cargo check`s to keep it honest.

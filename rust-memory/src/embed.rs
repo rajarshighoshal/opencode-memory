@@ -35,8 +35,10 @@ struct EmbedReq<'a> {
 #[derive(Debug, Deserialize)]
 struct EmbedItem {
     embedding: Vec<f32>,
+    /// `Option` so an absent `index` differs from a present `0` (a server omitting
+    /// it would otherwise collapse every item onto slot 0).
     #[serde(default)]
-    index: usize,
+    index: Option<usize>,
 }
 
 /// Top-level response.
@@ -186,7 +188,26 @@ impl EmbedClient {
                     }
                     break;
                 }
-                Err(e) => return Err(EmbedError::Http(e)),
+                Err(e) => {
+                    // Other transport error (e.g. a watchdog-severed keep-alive
+                    // mid-request). Self-heal once like the connect arm, then back
+                    // off; bounded by the loop counter + `ensured`.
+                    last_err = Some(EmbedError::Http(e));
+                    if !ensured {
+                        ensured = true;
+                        self.ensure_server().await?;
+                        continue;
+                    }
+                    if backoff_idx < backoff_ms.len() {
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            backoff_ms[backoff_idx],
+                        ))
+                        .await;
+                        backoff_idx += 1;
+                        continue;
+                    }
+                    break;
+                }
             }
         }
 
@@ -502,10 +523,23 @@ fn reorder_and_validate(items: Vec<EmbedItem>, expected_len: usize, dim: usize) 
             items.len()
         )));
     }
-    // Place each item at out[index], rejecting duplicate / out-of-bounds indices.
+    // Place each item at out[index]. If every item omits `index`, fall back to
+    // positional order instead of collapsing onto slot 0.
+    let all_missing = items.iter().all(|it| it.index.is_none());
     let mut out: Vec<Option<Vec<f32>>> = (0..expected_len).map(|_| None).collect();
-    for item in items {
-        let idx = item.index;
+    for (pos, item) in items.into_iter().enumerate() {
+        let idx = if all_missing {
+            pos
+        } else {
+            match item.index {
+                Some(i) => i,
+                None => {
+                    return Err(EmbedError::BadResponse(
+                        "response mixes items with and without an `index` field".into(),
+                    ))
+                }
+            }
+        };
         if idx >= expected_len {
             return Err(EmbedError::BadResponse(format!(
                 "out-of-bounds index {idx} for batch size {expected_len}"
@@ -564,5 +598,39 @@ mod tests {
             client("https://gpu:8443/v1/embeddings").health_url(),
             "https://gpu:8443/health"
         );
+    }
+
+    // ––– reorder_and_validate: index handling (bug-hunt) –––
+
+    #[test]
+    fn reorder_positional_when_all_index_absent() {
+        // Server omitted `index` on every item → positional order, not all-slot-0.
+        let items = vec![
+            EmbedItem { embedding: vec![1.0; 3], index: None },
+            EmbedItem { embedding: vec![2.0; 3], index: None },
+        ];
+        let out = reorder_and_validate(items, 2, 3).unwrap();
+        assert_eq!(out[0], vec![1.0; 3]);
+        assert_eq!(out[1], vec![2.0; 3]);
+    }
+
+    #[test]
+    fn reorder_honors_explicit_out_of_order_index() {
+        let items = vec![
+            EmbedItem { embedding: vec![9.0; 3], index: Some(1) },
+            EmbedItem { embedding: vec![8.0; 3], index: Some(0) },
+        ];
+        let out = reorder_and_validate(items, 2, 3).unwrap();
+        assert_eq!(out[0], vec![8.0; 3]);
+        assert_eq!(out[1], vec![9.0; 3]);
+    }
+
+    #[test]
+    fn reorder_rejects_mixed_index_presence() {
+        let items = vec![
+            EmbedItem { embedding: vec![1.0; 3], index: Some(0) },
+            EmbedItem { embedding: vec![2.0; 3], index: None },
+        ];
+        assert!(reorder_and_validate(items, 2, 3).is_err());
     }
 }

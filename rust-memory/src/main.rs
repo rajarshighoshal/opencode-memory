@@ -25,6 +25,7 @@ mod config;
 mod consolidate;
 mod embed;
 mod error;
+mod evict;
 mod format;
 mod hashing;
 mod maintenance;
